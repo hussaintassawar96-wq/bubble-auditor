@@ -15,7 +15,7 @@ CALENDLY_URL = "https://calendly.com/tassawarhussain/30min"
 REQUEST_TIMEOUT = 12
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "BubbleAppAuditor/2.1 (+public-scan)"})
+SESSION.headers.update({"User-Agent": "BubbleAppAuditor/2.2 (+public-scan)"})
 
 
 # ---------------------------
@@ -255,7 +255,186 @@ def build_evidence_lines(scan):
     return "\n".join(lines)[:4000]
 
 
-def calc_scores(home_blocked, header_score, meta_exposed, swagger_exposed, html_kb, script_count):
+# ---------------------------
+# SEO CHECKS (PUBLIC ONLY)
+# ---------------------------
+def extract_meta(html: str, name: str):
+    m = re.search(
+        rf'<meta[^>]+name=["\']{re.escape(name)}["\'][^>]*content=["\']([^"\']*)["\']',
+        html,
+        re.I
+    )
+    return (m.group(1).strip() if m else "")
+
+
+def extract_prop(html: str, prop: str):
+    m = re.search(
+        rf'<meta[^>]+property=["\']{re.escape(prop)}["\'][^>]*content=["\']([^"\']*)["\']',
+        html,
+        re.I
+    )
+    return (m.group(1).strip() if m else "")
+
+
+def extract_link_rel(html: str, rel: str):
+    m = re.search(
+        rf'<link[^>]+rel=["\']{re.escape(rel)}["\'][^>]*href=["\']([^"\']+)["\']',
+        html,
+        re.I
+    )
+    return (m.group(1).strip() if m else "")
+
+
+def h1_count(html: str):
+    return len(re.findall(r"<h1\b", html, re.I))
+
+
+def has_structured_data(html: str):
+    # JSON-LD
+    if re.search(r'<script[^>]+type=["\']application/ld\+json["\']', html, re.I):
+        return True
+    # microdata signals
+    if re.search(r'itemscope|itemtype=', html, re.I):
+        return True
+    return False
+
+
+def image_alt_sample_stats(html: str, sample_limit: int = 30):
+    imgs = re.findall(r"<img\b[^>]*>", html, re.I)
+    imgs = imgs[:sample_limit]
+    if not imgs:
+        return 0, 0, 0
+    with_alt = 0
+    empty_alt = 0
+    for tag in imgs:
+        m = re.search(r'alt=["\']([^"\']*)["\']', tag, re.I)
+        if m:
+            with_alt += 1
+            if m.group(1).strip() == "":
+                empty_alt += 1
+    return len(imgs), with_alt, empty_alt
+
+
+def build_seo_findings(base: str, home_html: str, home_headers: dict):
+    findings = []
+    score = 100
+
+    title = find_title(home_html)
+    desc = extract_meta(home_html, "description")
+    robots_meta = extract_meta(home_html, "robots")
+    canonical = extract_link_rel(home_html, "canonical")
+    og_title = extract_prop(home_html, "og:title")
+    og_desc = extract_prop(home_html, "og:description")
+    og_img = extract_prop(home_html, "og:image")
+    tw_card = extract_meta(home_html, "twitter:card")
+    h1s = h1_count(home_html)
+    schema_ok = has_structured_data(home_html)
+    img_n, img_with_alt, img_empty_alt = image_alt_sample_stats(home_html)
+
+    # robots.txt and sitemap.xml
+    robots_url = urljoin(base + "/", "robots.txt")
+    sitemap_url = urljoin(base + "/", "sitemap.xml")
+    r_code, _, r_txt, _, _, _ = safe_get(robots_url)
+    s_code, _, s_txt, _, _, _ = safe_get(sitemap_url)
+
+    # indexability hint from headers
+    x_robots = ""
+    for hk, hv in (home_headers or {}).items():
+        if hk.lower() == "x-robots-tag":
+            x_robots = hv.strip()
+            break
+
+    # TITLE
+    if not title:
+        findings.append(("High", "Missing <title> tag", "No title found on homepage HTML.", "Add a unique title (50–60 chars) describing the page + brand."))
+        score -= 18
+    elif len(title) < 10:
+        findings.append(("Medium", "Title looks too short", f"Title: {title}", "Expand title to be descriptive (include key product keyword + brand)."))
+        score -= 8
+
+    # META DESCRIPTION
+    if not desc:
+        findings.append(("Medium", "Missing meta description", "No meta description found.", "Add a 140–160 char description that sells the value + includes keyword."))
+        score -= 10
+    elif len(desc) < 50:
+        findings.append(("Low", "Meta description is very short", f"Description: {desc}", "Expand description to improve CTR on search results."))
+        score -= 4
+
+    # CANONICAL
+    if not canonical:
+        findings.append(("Medium", "Missing canonical URL", "No rel=canonical found.", "Add canonical to avoid duplicate URL indexing issues."))
+        score -= 8
+
+    # ROBOTS META / X-ROBOTS-TAG
+    block_signals = []
+    if robots_meta and ("noindex" in robots_meta.lower() or "nofollow" in robots_meta.lower()):
+        block_signals.append(f'meta robots="{robots_meta}"')
+    if x_robots and ("noindex" in x_robots.lower() or "nofollow" in x_robots.lower()):
+        block_signals.append(f'X-Robots-Tag="{x_robots}"')
+    if block_signals:
+        findings.append(("High", "Indexing may be blocked", " | ".join(block_signals), "Remove noindex/nofollow on public pages you want to rank."))
+        score -= 20
+
+    # ROBOTS.TXT
+    if r_code != 200:
+        findings.append(("Low", "robots.txt not found", f"GET {robots_url} → {r_code}", "Add robots.txt to control crawling and list your sitemap."))
+        score -= 4
+    else:
+        if re.search(r"Disallow:\s*/\s*$", r_txt, re.I | re.M):
+            findings.append(("Medium", "robots.txt may block all crawling", "robots.txt contains 'Disallow: /'", "Allow crawling for public marketing pages."))
+            score -= 10
+
+    # SITEMAP
+    if s_code != 200:
+        findings.append(("Low", "sitemap.xml not found", f"GET {sitemap_url} → {s_code}", "Add sitemap.xml for better discovery (especially for many pages)."))
+        score -= 4
+    else:
+        if "<urlset" not in (s_txt or ""):
+            findings.append(("Info", "sitemap.xml exists but may not be standard", "sitemap.xml didn’t include <urlset> in first check.", "Verify it’s a valid XML sitemap."))
+
+    # OG / Social previews
+    if not (og_title and og_desc and og_img):
+        findings.append(("Low", "OpenGraph tags incomplete", f"og:title={bool(og_title)}, og:description={bool(og_desc)}, og:image={bool(og_img)}", "Add OG tags for better link previews and CTR."))
+        score -= 4
+    if not tw_card:
+        findings.append(("Info", "Twitter card not set", "twitter:card missing.", "Add twitter:card (summary_large_image) for better previews."))
+
+    # H1
+    if h1s == 0:
+        findings.append(("Medium", "No H1 found on homepage", "No <h1> tag detected.", "Add a single H1 describing your main offer (keyword + value)."))
+        score -= 10
+    elif h1s > 1:
+        findings.append(("Low", "Multiple H1 tags detected", f"H1 count: {h1s}", "Prefer a single H1 per page for clarity."))
+        score -= 4
+
+    # Structured data
+    if not schema_ok:
+        findings.append(("Low", "No structured data detected", "No JSON-LD / microdata found.", "Add JSON-LD (Organization, WebSite, Product/Service) for richer results."))
+        score -= 4
+
+    # Image alt
+    if img_n > 0:
+        coverage = int((img_with_alt / max(1, img_n)) * 100)
+        if coverage < 60:
+            findings.append(("Low", "Many images missing alt text (sample)", f"Sampled {img_n} images, alt coverage ~{coverage}%", "Add alt text for accessibility + image SEO."))
+            score -= 4
+        if img_empty_alt > 5:
+            findings.append(("Info", "Some images have empty alt", f"Empty alt count (sample): {img_empty_alt}", "Use empty alt only for decorative images; otherwise describe the image."))
+
+    score = max(5, min(100, score))
+    if not findings:
+        findings.append(("Low", "No obvious SEO issues detected (public scan)", "Title, description, canonical, and crawling basics look fine.", "Consider adding structured data + improving content depth for competitive keywords."))
+
+    bullets = [
+        f"Title: {'present' if bool(title) else 'missing'}; Description: {'present' if bool(desc) else 'missing'}; Canonical: {'present' if bool(canonical) else 'missing'}",
+        f"robots.txt: {'OK' if r_code==200 else 'missing'}; sitemap.xml: {'OK' if s_code==200 else 'missing'}",
+        f"H1 tags: {h1s}; Structured data: {'found' if schema_ok else 'not found'}",
+    ]
+
+    return score, bullets, findings
+
+
+def calc_scores(home_blocked, header_score, meta_exposed, swagger_exposed, html_kb, script_count, seo_score):
     sec = 100
     sec -= int((100 - header_score) * 0.45)
     if meta_exposed:
@@ -284,7 +463,10 @@ def calc_scores(home_blocked, header_score, meta_exposed, swagger_exposed, html_
     if swagger_exposed:
         maint -= 10
     maint = max(10, min(100, maint))
-    return sec, perf, maint
+
+    seo = seo_score
+
+    return sec, perf, maint, seo
 
 
 def stable_cache_key(app_url: str, app_id: str, env: str):
@@ -340,7 +522,15 @@ def run_public_scan_cached(app_url: str, app_id: str, env: str, cache_key: str):
             break
     cache_missing = (not cache_control) and (not home_blocked)
 
-    sec, perf, maint = calc_scores(home_blocked, header_score, meta_exposed, swagger_exposed, html_kb, script_count)
+    # SEO (public only, requires HTML)
+    if home_blocked or not html:
+        seo_score = 0
+        seo_bullets = ["SEO checks limited because homepage HTML is not publicly accessible (401/403)."]
+        seo_findings = [("Info", "SEO checks limited", f"GET {home_url} → {code}", "Make a public marketing page for accurate SEO checks.")]
+    else:
+        seo_score, seo_bullets, seo_findings = build_seo_findings(base, html, headers or {})
+
+    sec, perf, maint, seo = calc_scores(home_blocked, header_score, meta_exposed, swagger_exposed, html_kb, script_count, seo_score)
 
     key_bullets = []
     key_bullets.append("Homepage is protected (401/403) or public; this affects what can be measured.")
@@ -350,6 +540,7 @@ def run_public_scan_cached(app_url: str, app_id: str, env: str, cache_key: str):
         key_bullets.append("Performance snapshot is limited because HTML isn’t accessible to public scan.")
     else:
         key_bullets.append(f"Homepage snapshot: ~{html_kb} KB HTML and ~{script_count} script tags.")
+    key_bullets.extend(seo_bullets[:2])
 
     findings_security = []
     if meta_exposed:
@@ -379,7 +570,7 @@ def run_public_scan_cached(app_url: str, app_id: str, env: str, cache_key: str):
                               f"HTML ≈ {html_kb} KB, scripts ≈ {script_count}",
                               "Reduce plugin bloat, defer heavy scripts, avoid workflows on page load."))
         if cache_missing:
-            findings_perf.append(("Low", "Cache-Control not detected",
+            findings_perf.append(("Low", "Cache-Control not detected on homepage response",
                                   "Cache-Control header missing",
                                   "Configure caching for static assets at CDN/proxy level."))
 
@@ -399,9 +590,14 @@ def run_public_scan_cached(app_url: str, app_id: str, env: str, cache_key: str):
         "logo_url": logo_url,
         "home_url": home_url,
         "steps": steps,
-        "scores": {"security": sec, "performance": perf, "maintainability": maint},
+        "scores": {"security": sec, "performance": perf, "maintainability": maint, "seo": seo},
         "key_bullets": key_bullets,
-        "findings": {"security": findings_security, "performance": findings_perf, "maintainability": findings_maint},
+        "findings": {
+            "security": findings_security,
+            "performance": findings_perf,
+            "maintainability": findings_maint,
+            "seo": seo_findings
+        },
         "evidence": build_evidence_lines({"steps": steps, "probe": probe}),
     }
 
@@ -475,7 +671,6 @@ with c3:
 
 run_btn = st.button("Run scan", type="primary", use_container_width=True)
 
-# Reset unlock when inputs change
 fingerprint = stable_cache_key(app_url, app_id, env)
 if st.session_state.get("last_fingerprint") != fingerprint:
     st.session_state["lead_unlocked"] = False
@@ -485,6 +680,7 @@ if st.session_state.get("last_fingerprint") != fingerprint:
 if not run_btn and "last_scan" not in st.session_state:
     st.info("Enter App URL or Bubble App ID, choose environment, then click **Run scan**.")
     st.stop()
+
 
 # ---------------------------
 # RUN SCAN
@@ -515,6 +711,7 @@ if run_btn or "last_scan" in st.session_state:
 else:
     scan = st.session_state.get("last_scan")
 
+
 # ---------------------------
 # LAYOUT
 # ---------------------------
@@ -540,11 +737,13 @@ with L:
             st.write(f"{icon} {name} — {code} — {ms}")
 
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
+
     s = scan["scores"]["security"]
     p = scan["scores"]["performance"]
     m = scan["scores"]["maintainability"]
+    seo = scan["scores"]["seo"]
 
-    k1, k2, k3 = st.columns(3)
+    k1, k2 = st.columns(2)
     with k1:
         st.markdown('<div class="kpi">', unsafe_allow_html=True)
         st.markdown("**Security**")
@@ -555,10 +754,17 @@ with L:
         st.markdown("**Performance**")
         st.markdown(f"<h2 style='margin:0;'>{'N/A' if p==0 else p}</h2>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
+
+    k3, k4 = st.columns(2)
     with k3:
         st.markdown('<div class="kpi">', unsafe_allow_html=True)
         st.markdown("**Maintainability**")
         st.markdown(f"<h2 style='margin:0;'>{m}</h2>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+    with k4:
+        st.markdown('<div class="kpi">', unsafe_allow_html=True)
+        st.markdown("**SEO**")
+        st.markdown(f"<h2 style='margin:0;'>{'N/A' if seo==0 else seo}</h2>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
@@ -572,7 +778,7 @@ with L:
 with R:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("### Key risks and focus areas")
-    for b in scan.get("key_bullets", [])[:6]:
+    for b in scan.get("key_bullets", [])[:7]:
         st.write(f"• {b}")
     st.markdown("</div>", unsafe_allow_html=True)
     st.write("")
@@ -592,26 +798,26 @@ with R:
     st.write("")
     render_items(scan["findings"]["maintainability"], gated=gated)
 
-    # CTA button that opens modal
+    section_header("SEO", scan["scores"]["seo"])
+    st.write("")
+    render_items(scan["findings"]["seo"], gated=gated)
+
     st.write("")
     if not unlocked:
         open_popup = st.button("Unlock full fix plan + book a call", type="primary", use_container_width=True)
     else:
         open_popup = st.button("Open booking popup", use_container_width=True)
 
+
 # ---------------------------
 # MODAL POPUP
 # ---------------------------
 modal = Modal(title="Unlock full Fix Plan + Book a 30-min call", key="unlock_modal", max_width=800)
 
-if "open_popup_now" not in st.session_state:
-    st.session_state["open_popup_now"] = False
-
 if "lead_step" not in st.session_state:
-    st.session_state["lead_step"] = "form"  # form -> calendly
+    st.session_state["lead_step"] = "form"
 
-if "open_popup" in locals() and open_popup:
-    st.session_state["open_popup_now"] = True
+if open_popup:
     modal.open()
 
 if modal.is_open():
@@ -628,7 +834,7 @@ if modal.is_open():
     <span class="pill">✅ Prioritized fix list</span>
     <span class="pill">✅ Security hardening checklist</span>
     <span class="pill">✅ Performance cleanup plan</span>
-    <span class="pill">✅ Tech debt + maintainability cleanup</span>
+    <span class="pill">✅ SEO quick wins</span>
   </div>
 </div>
 """,
@@ -637,7 +843,6 @@ if modal.is_open():
 
         st.write("")
 
-        # Step 1: Lead Form
         if not st.session_state.get("lead_unlocked", False) or st.session_state["lead_step"] == "form":
             st.markdown("#### Enter details to unlock full fixes")
             with st.form("lead_form_modal", clear_on_submit=False):
@@ -649,30 +854,18 @@ if modal.is_open():
                 with c2:
                     company = st.text_input("Company (optional)")
                     timeline = st.selectbox("Timeline", ["ASAP (this week)", "This month", "Next 1–3 months", "Just exploring"])
-                    notes = st.text_area("What should I know? (optional)", placeholder="e.g. payments, marketplace, user files, multi-tenant, etc.")
+                    notes = st.text_area("What should I know? (optional)", placeholder="e.g. marketplace, user files, paid plans, etc.")
 
                 submitted = st.form_submit_button("Unlock + Continue to booking", type="primary", use_container_width=True)
 
             if submitted:
                 st.session_state["lead_unlocked"] = True
                 st.session_state["lead_step"] = "calendly"
-                st.session_state["lead_data"] = {
-                    "name": name,
-                    "email": email,
-                    "role": role,
-                    "company": company,
-                    "timeline": timeline,
-                    "notes": notes,
-                    "scanned_base": scan.get("base", ""),
-                    "scores": scan.get("scores", {}),
-                    "timestamp": int(time.time())
-                }
                 st.success("Unlocked ✅ Now pick a meeting time below.")
 
-        # Step 2: Calendly
         if st.session_state.get("lead_unlocked", False) and st.session_state["lead_step"] == "calendly":
             st.markdown("#### Book your 30-minute meeting")
-            st.markdown('<div class="small">Pick a time that works. I’ll review your scan and share the fastest wins first.</div>', unsafe_allow_html=True)
+            st.markdown('<div class="small">I’ll review your scan and point out the fastest wins first.</div>', unsafe_allow_html=True)
 
             st.components.v1.html(
                 f"""
@@ -691,5 +884,4 @@ if modal.is_open():
                 if st.button("Start over", use_container_width=True):
                     st.session_state["lead_unlocked"] = False
                     st.session_state["lead_step"] = "form"
-                    st.session_state["lead_data"] = None
                     modal.close()
