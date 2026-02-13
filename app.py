@@ -1,796 +1,555 @@
+# app.py
+# Bubble + Lovable Public Auditor (Streamlit)
+# - Validates URL/App ID before scanning
+# - Public-only checks (no editor access, no private APIs)
+# - Shows Security / Performance / SEO
+# - Lead unlock + Calendly booking in a popup (modal)
+
 import re
 import time
+import json
 import hashlib
-from urllib.parse import urljoin, urlparse
+from dataclasses import dataclass
+from typing import Dict, Any, Tuple, Optional, List
+from urllib.parse import urlparse
 
 import requests
 import streamlit as st
-from streamlit_modal import Modal
 
-
-# ---------------------------
+# -----------------------------
 # CONFIG
-# ---------------------------
+# -----------------------------
+APP_TITLE = "Bubble App Auditor"
 CALENDLY_URL = "https://calendly.com/tassawarhussain/30min"
-REQUEST_TIMEOUT = 12
+REQUEST_TIMEOUT = 10
 
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "AppAuditor/3.0 (+public-scan)"})
-
-
-# ---------------------------
-# PAGE SETUP + STYLES
-# ---------------------------
-st.set_page_config(page_title="App Auditor", page_icon="🧪", layout="wide")
-
-st.markdown(
-    """
-<style>
-:root{
-  --card: rgba(255,255,255,0.06);
-  --card2: rgba(255,255,255,0.04);
-  --stroke: rgba(255,255,255,0.10);
-  --muted: rgba(255,255,255,0.72);
-  --accent: #b36bff;
-  --accent2: #7c5cff;
-  --good: #32d583;
-  --warn: #fdb022;
-  --bad: #ff4d4f;
-  --info: #69b1ff;
-}
-.block-container {padding-top: 1.2rem;}
-h1, h2, h3 {letter-spacing: -0.02em;}
-.small {font-size: 13px; color: var(--muted);}
-.card{
-  border: 1px solid var(--stroke);
-  border-radius: 18px;
-  padding: 16px;
-  background: var(--card);
-}
-.card2{
-  border: 1px solid var(--stroke);
-  border-radius: 18px;
-  padding: 16px;
-  background: var(--card2);
-}
-.pill{
-  display:inline-flex;
-  align-items:center;
-  gap:8px;
-  padding: 7px 12px;
-  border-radius: 999px;
-  border: 1px solid var(--stroke);
-  background: rgba(0,0,0,0.20);
-  font-size: 12px;
-  font-weight: 700;
-}
-.kpi{
-  border: 1px solid var(--stroke);
-  border-radius: 16px;
-  padding: 12px;
-  background: rgba(0,0,0,0.18);
-}
-.hr{height:1px; background: var(--stroke); margin: 14px 0;}
-.badge{
-  display:inline-block;
-  padding:6px 10px;
-  border-radius:999px;
-  font-size:12px;
-  font-weight:700;
-  border:1px solid var(--stroke);
-}
-.sev-High{background:#ff4d4f22;color:#ff7875;border:1px solid #ff4d4f55;}
-.sev-Medium{background:#fdb02222;color:#ffd666;border:1px solid #fdb02255;}
-.sev-Low{background:#32d58322;color:#95de64;border:1px solid #32d58355;}
-.sev-Info{background:#69b1ff22;color:#91caff;border:1px solid #69b1ff55;}
-.evidence{
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-  font-size: 12px;
-  color: rgba(255,255,255,0.80);
-  background: rgba(0,0,0,0.22);
-  border: 1px solid var(--stroke);
-  border-radius: 12px;
-  padding: 10px;
-  overflow-x:auto;
-}
-.cta{
-  border: 1px solid rgba(179,107,255,0.45);
-  background: radial-gradient(1200px 400px at 10% 0%, rgba(179,107,255,0.35), transparent),
-              radial-gradient(900px 300px at 70% 10%, rgba(124,92,255,0.25), transparent),
-              rgba(255,255,255,0.04);
-  border-radius: 20px;
-  padding: 18px;
-}
-</style>
-""",
-    unsafe_allow_html=True
-)
-
-
-# ---------------------------
-# HELPERS
-# ---------------------------
-def normalize_url(u: str) -> str:
-    u = (u or "").strip()
-    if not u:
+# -----------------------------
+# UTILITIES
+# -----------------------------
+def normalize_url(url: str) -> str:
+    if not url:
         return ""
-    if not u.startswith("http://") and not u.startswith("https://"):
-        u = "https://" + u
-    return u.rstrip("/")
+    url = url.strip()
+    if not url:
+        return ""
+    if not url.startswith("http://") and not url.startswith("https://"):
+        url = "https://" + url
+    # strip trailing slash
+    url = url.rstrip("/")
+    return url
 
-
-def is_valid_url(u: str) -> bool:
+def is_valid_url(url: str) -> bool:
     try:
-        p = urlparse(u)
-        return bool(p.scheme and p.netloc)
+        p = urlparse(url)
+        return p.scheme in ("http", "https") and bool(p.netloc)
     except Exception:
         return False
 
+def stable_cache_key(*parts) -> str:
+    s = "|".join([str(p).strip().lower() for p in parts])
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
-def env_base_from_inputs(app_url: str, app_id: str, env: str) -> str:
-    app_url = normalize_url(app_url)
-    app_id = (app_id or "").strip()
+def safe_head(url: str) -> Tuple[Optional[int], Dict[str, str], float, Optional[str]]:
+    try:
+        t0 = time.time()
+        r = requests.head(url, allow_redirects=True, timeout=REQUEST_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
+        return r.status_code, dict(r.headers), (time.time() - t0), None
+    except Exception as e:
+        return None, {}, 0.0, str(e)
 
-    if app_url:
-        base = app_url
-    else:
-        if not app_id:
-            return ""
-        base = f"https://{app_id}.bubbleapps.io"
+def safe_get(url: str) -> Tuple[Optional[int], Dict[str, str], str, float, Optional[str]]:
+    try:
+        t0 = time.time()
+        r = requests.get(url, allow_redirects=True, timeout=REQUEST_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
+        text = r.text if isinstance(r.text, str) else ""
+        return r.status_code, dict(r.headers), text, (time.time() - t0), None
+    except Exception as e:
+        return None, {}, "", 0.0, str(e)
 
+def quick_access_check(url: str) -> Tuple[bool, str]:
+    """
+    Returns: (ok: bool, message: str)
+    - Checks URL format
+    - Checks reachability (HEAD then GET fallback)
+    """
+    u = normalize_url(url)
+    if not u or not is_valid_url(u):
+        return False, "URL is not valid. Please enter a full domain (e.g. https://yourapp.com)."
+
+    code, headers, elapsed, err = safe_head(u + "/")
+    if code is None:
+        code2, headers2, text2, elapsed2, err2 = safe_get(u + "/")
+        if code2 is None:
+            return False, "URL is not accessible (network error / blocked). Try again or use another URL."
+        code = code2
+
+    # Reachable but restricted (allow scan, but warn)
+    if code in (401, 403):
+        return True, "URL is reachable but restricted (401/403). Public checks may be limited."
+
+    # Hard fail cases
+    if code == 404:
+        return False, "URL returned 404 (page not found). Please check the domain/path."
+    if code in (500, 502, 503, 504):
+        return False, f"URL is reachable but server returned {code}. Try again later."
+
+    if 200 <= code < 400:
+        return True, "OK"
+
+    return False, f"URL returned status {code}. Please confirm it’s correct."
+
+def is_valid_bubble_app_id(app_id: str) -> bool:
+    """
+    Bubble app IDs commonly look like: yourapp-28503
+    We'll allow letters/numbers/dashes and must end with -digits.
+    """
+    if not app_id:
+        return True
+    app_id = app_id.strip()
+    return bool(re.match(r"^[a-z0-9-]+-\d+$", app_id, re.I))
+
+def bubble_base_from_env(app_id: str, env: str, url_override: str) -> str:
+    """
+    If URL is provided, use it.
+    Else try bubbleapps.io guess based on env.
+    """
+    if url_override:
+        return normalize_url(url_override)
+
+    # If user only gave app_id, attempt bubbleapps.io default pattern
+    # NOTE: Many apps use custom domains; this is just a best-effort fallback.
+    # Bubble test can be: https://appname.bubbleapps.io/version-test
+    # Live can be:       https://appname.bubbleapps.io
+    # App ID isn't always the same as subdomain. But user wants App ID input like NQU.
+    # We'll still prefer URL input for accuracy.
+    # We'll attempt to use app_id prefix before last dash as subdomain.
+    sub = app_id.rsplit("-", 1)[0].strip().lower()
+    if not sub:
+        return ""
     if env == "version-test":
-        if not base.endswith("/version-test"):
-            base = base + "/version-test"
+        return f"https://{sub}.bubbleapps.io/version-test"
+    return f"https://{sub}.bubbleapps.io"
 
-    if env == "live":
-        if base.endswith("/version-test"):
-            base = base[: -len("/version-test")]
+# -----------------------------
+# AUDIT CHECKS
+# -----------------------------
+SECURITY_HEADERS_RECOMMENDED = [
+    "content-security-policy",
+    "strict-transport-security",
+    "x-frame-options",
+    "x-content-type-options",
+    "referrer-policy",
+    "permissions-policy",
+]
 
-    return base.rstrip("/")
+SEO_TAGS = {
+    "title": re.compile(r"<title>(.*?)</title>", re.I | re.S),
+    "meta_desc": re.compile(r'<meta\s+name=["\']description["\']\s+content=["\'](.*?)["\']', re.I | re.S),
+    "canonical": re.compile(r'<link\s+rel=["\']canonical["\']\s+href=["\'](.*?)["\']', re.I | re.S),
+    "robots_meta": re.compile(r'<meta\s+name=["\']robots["\']\s+content=["\'](.*?)["\']', re.I | re.S),
+    "h1": re.compile(r"<h1[^>]*>(.*?)</h1>", re.I | re.S),
+}
 
-
-def safe_get(url: str):
-    t0 = time.time()
-    try:
-        r = SESSION.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-        elapsed = time.time() - t0
-        js = None
-        ct = (r.headers.get("content-type") or "").lower()
-        if "json" in ct:
-            try:
-                js = r.json()
-            except Exception:
-                js = None
-        return r.status_code, dict(r.headers), r.text, js, elapsed, None
-    except Exception as e:
-        elapsed = time.time() - t0
-        return None, {}, "", None, elapsed, str(e)
-
-
-def safe_head(url: str):
-    t0 = time.time()
-    try:
-        r = SESSION.head(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-        elapsed = time.time() - t0
-        return r.status_code, dict(r.headers), elapsed, None
-    except Exception as e:
-        elapsed = time.time() - t0
-        return None, {}, elapsed, str(e)
-
-
-def find_title(html: str):
-    m = re.search(r"<title>(.*?)</title>", html, re.I | re.S)
+def extract_first(regex: re.Pattern, html: str) -> str:
+    m = regex.search(html or "")
     if not m:
         return ""
-    t = re.sub(r"\s+", " ", m.group(1)).strip()
-    return t[:120]
+    val = m.group(1)
+    val = re.sub(r"\s+", " ", val).strip()
+    # strip remaining tags for H1
+    val = re.sub(r"<[^>]+>", "", val).strip()
+    return val
 
-
-def find_favicon(html: str, base_url: str):
-    m = re.search(r'<link[^>]+rel=["\'](?:shortcut icon|icon)["\'][^>]*>', html, re.I)
-    if m:
-        tag = m.group(0)
-        href = re.search(r'href=["\']([^"\']+)["\']', tag, re.I)
-        if href:
-            return urljoin(base_url + "/", href.group(1))
-    return urljoin(base_url + "/", "favicon.ico")
-
-
-def find_og_image(html: str, base_url: str):
-    m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]*content=["\']([^"\']+)["\']', html, re.I)
-    if m:
-        return urljoin(base_url + "/", m.group(1))
+def detect_favicon(base_url: str) -> str:
+    # Try common favicon path
+    code, headers, text, elapsed, err = safe_get(base_url + "/favicon.ico")
+    if code and 200 <= code < 400:
+        return base_url + "/favicon.ico"
     return ""
 
-
-def score_headers(h: dict):
-    checks = {
-        "Content-Security-Policy": False,
-        "Strict-Transport-Security": False,
-        "X-Frame-Options": False,
-        "X-Content-Type-Options": False,
-        "Referrer-Policy": False,
-        "Permissions-Policy": False,
-    }
-    for k in list(checks.keys()):
-        for hk in h.keys():
-            if hk.lower() == k.lower():
-                checks[k] = True
-                break
-    missing = [k for k, ok in checks.items() if not ok]
-    present = [k for k, ok in checks.items() if ok]
-    score = int((len(present) / len(checks)) * 100)
-    return score, present, missing
-
-
-def extract_swagger_stats(swagger_json):
-    paths = {}
-    if isinstance(swagger_json, dict) and isinstance(swagger_json.get("paths"), dict):
-        paths = swagger_json["paths"]
-    total_paths = len(paths)
-    methods = 0
-    for _, obj in paths.items():
-        if isinstance(obj, dict):
-            methods += len([k for k in obj.keys() if k.lower() in ("get", "post", "put", "patch", "delete")])
-    return total_paths, methods, list(paths.keys())[:30]
-
-
-def probe_paths(base: str, paths):
-    out = []
-    for p in paths:
-        url = urljoin(base + "/", p.lstrip("/"))
-        code, headers, elapsed, err = safe_head(url)
-        out.append({"path": p, "url": url, "status": code, "elapsed": elapsed, "error": err})
-    return out
-
-
-def build_evidence_lines(steps, probe=None):
-    lines = []
-    for (name, url, code, elapsed, err) in steps:
-        ms = f"{int(elapsed*1000)}ms"
-        if code is None:
-            lines.append(f"{name}: ERROR ({err}) — {ms}")
+def check_security_headers(headers: Dict[str, str]) -> Dict[str, Any]:
+    lower = {k.lower(): v for k, v in (headers or {}).items()}
+    missing = []
+    present = []
+    for h in SECURITY_HEADERS_RECOMMENDED:
+        if h in lower:
+            present.append(h)
         else:
-            lines.append(f"{name}: {code} — {ms} — {url}")
+            missing.append(h)
 
-    for pr in (probe or [])[:8]:
-        s = pr.get("status")
-        ms = f"{int(pr.get('elapsed',0)*1000)}ms"
-        lines.append(f"Probe {pr['path']}: {s} — {ms}")
+    issues = []
+    if missing:
+        issues.append({
+            "title": "Missing recommended security headers",
+            "severity": "Medium",
+            "details": "Missing: " + ", ".join([h.title() if "-" not in h else h for h in missing]) +
+                       ". These reduce XSS/clickjacking/mixed-content risk."
+        })
+    else:
+        issues.append({
+            "title": "Recommended security headers present",
+            "severity": "Low",
+            "details": "All common security headers detected on the homepage response."
+        })
 
-    return "\n".join(lines)[:4000]
+    return {
+        "missing": missing,
+        "present": present,
+        "issues": issues
+    }
 
+def check_cache_headers(headers: Dict[str, str]) -> Dict[str, Any]:
+    lower = {k.lower(): v for k, v in (headers or {}).items()}
+    cc = lower.get("cache-control", "")
+    if not cc:
+        return {
+            "issues": [{
+                "title": "Cache-Control not detected on homepage response",
+                "severity": "Low",
+                "details": "If static assets are not cached aggressively, repeat visits may be slower."
+            }]
+        }
+    return {
+        "issues": [{
+            "title": "Cache-Control detected",
+            "severity": "Info",
+            "details": f"Cache-Control: {cc}"
+        }]
+    }
 
-# ---------------------------
-# SEO CHECKS (PUBLIC ONLY)
-# ---------------------------
-def extract_meta(html: str, name: str):
-    m = re.search(
-        rf'<meta[^>]+name=["\']{re.escape(name)}["\'][^>]*content=["\']([^"\']*)["\']',
-        html,
-        re.I
-    )
-    return (m.group(1).strip() if m else "")
+def check_seo(html: str) -> Dict[str, Any]:
+    title = extract_first(SEO_TAGS["title"], html)
+    meta_desc = extract_first(SEO_TAGS["meta_desc"], html)
+    canonical = extract_first(SEO_TAGS["canonical"], html)
+    robots_meta = extract_first(SEO_TAGS["robots_meta"], html)
+    h1 = extract_first(SEO_TAGS["h1"], html)
 
-
-def extract_prop(html: str, prop: str):
-    m = re.search(
-        rf'<meta[^>]+property=["\']{re.escape(prop)}["\'][^>]*content=["\']([^"\']*)["\']',
-        html,
-        re.I
-    )
-    return (m.group(1).strip() if m else "")
-
-
-def extract_link_rel(html: str, rel: str):
-    m = re.search(
-        rf'<link[^>]+rel=["\']{re.escape(rel)}["\'][^>]*href=["\']([^"\']+)["\']',
-        html,
-        re.I
-    )
-    return (m.group(1).strip() if m else "")
-
-
-def h1_count(html: str):
-    return len(re.findall(r"<h1\b", html, re.I))
-
-
-def has_structured_data(html: str):
-    if re.search(r'<script[^>]+type=["\']application/ld\+json["\']', html, re.I):
-        return True
-    if re.search(r'itemscope|itemtype=', html, re.I):
-        return True
-    return False
-
-
-def image_alt_sample_stats(html: str, sample_limit: int = 30):
-    imgs = re.findall(r"<img\b[^>]*>", html, re.I)
-    imgs = imgs[:sample_limit]
-    if not imgs:
-        return 0, 0, 0
-    with_alt = 0
-    empty_alt = 0
-    for tag in imgs:
-        m = re.search(r'alt=["\']([^"\']*)["\']', tag, re.I)
-        if m:
-            with_alt += 1
-            if m.group(1).strip() == "":
-                empty_alt += 1
-    return len(imgs), with_alt, empty_alt
-
-
-def build_seo_findings(base: str, home_html: str, home_headers: dict):
-    findings = []
+    issues = []
     score = 100
 
-    title = find_title(home_html)
-    desc = extract_meta(home_html, "description")
-    robots_meta = extract_meta(home_html, "robots")
-    canonical = extract_link_rel(home_html, "canonical")
-    og_title = extract_prop(home_html, "og:title")
-    og_desc = extract_prop(home_html, "og:description")
-    og_img = extract_prop(home_html, "og:image")
-    tw_card = extract_meta(home_html, "twitter:card")
-    h1s = h1_count(home_html)
-    schema_ok = has_structured_data(home_html)
-    img_n, img_with_alt, img_empty_alt = image_alt_sample_stats(home_html)
-
-    robots_url = urljoin(base + "/", "robots.txt")
-    sitemap_url = urljoin(base + "/", "sitemap.xml")
-    r_code, _, r_txt, _, _, _ = safe_get(robots_url)
-    s_code, _, s_txt, _, _, _ = safe_get(sitemap_url)
-
-    x_robots = ""
-    for hk, hv in (home_headers or {}).items():
-        if hk.lower() == "x-robots-tag":
-            x_robots = hv.strip()
-            break
-
     if not title:
-        findings.append(("High", "Missing <title> tag", "No title found on homepage HTML.", "Add a unique title (50–60 chars) describing the page + brand."))
-        score -= 18
-    elif len(title) < 10:
-        findings.append(("Medium", "Title looks too short", f"Title: {title}", "Expand title to be descriptive (include key product keyword + brand)."))
-        score -= 8
-
-    if not desc:
-        findings.append(("Medium", "Missing meta description", "No meta description found.", "Add a 140–160 char description that sells the value + includes keyword."))
-        score -= 10
-    elif len(desc) < 50:
-        findings.append(("Low", "Meta description is very short", f"Description: {desc}", "Expand description to improve CTR on search results."))
-        score -= 4
-
+        issues.append({"title": "Missing <title>", "severity": "High", "details": "Title tag is important for SEO and sharing previews."})
+        score -= 25
+    if not meta_desc:
+        issues.append({"title": "Missing meta description", "severity": "Medium", "details": "Meta description improves click-through and previews."})
+        score -= 15
     if not canonical:
-        findings.append(("Medium", "Missing canonical URL", "No rel=canonical found.", "Add canonical to avoid duplicate URL indexing issues."))
-        score -= 8
-
-    block_signals = []
-    if robots_meta and ("noindex" in robots_meta.lower() or "nofollow" in robots_meta.lower()):
-        block_signals.append(f'meta robots="{robots_meta}"')
-    if x_robots and ("noindex" in x_robots.lower() or "nofollow" in x_robots.lower()):
-        block_signals.append(f'X-Robots-Tag="{x_robots}"')
-    if block_signals:
-        findings.append(("High", "Indexing may be blocked", " | ".join(block_signals), "Remove noindex/nofollow on public pages you want to rank."))
-        score -= 20
-
-    if r_code != 200:
-        findings.append(("Low", "robots.txt not found", f"GET {robots_url} → {r_code}", "Add robots.txt to control crawling and list your sitemap."))
-        score -= 4
-    else:
-        if re.search(r"Disallow:\s*/\s*$", r_txt, re.I | re.M):
-            findings.append(("Medium", "robots.txt may block all crawling", "robots.txt contains 'Disallow: /'", "Allow crawling for public marketing pages."))
-            score -= 10
-
-    if s_code != 200:
-        findings.append(("Low", "sitemap.xml not found", f"GET {sitemap_url} → {s_code}", "Add sitemap.xml for better discovery (especially for many pages)."))
-        score -= 4
-    else:
-        if "<urlset" not in (s_txt or ""):
-            findings.append(("Info", "sitemap.xml exists but may not be standard", "sitemap.xml didn’t include <urlset> in first check.", "Verify it’s a valid XML sitemap."))
-
-    if not (og_title and og_desc and og_img):
-        findings.append(("Low", "OpenGraph tags incomplete", f"og:title={bool(og_title)}, og:description={bool(og_desc)}, og:image={bool(og_img)}", "Add OG tags for better link previews and CTR."))
-        score -= 4
-    if not tw_card:
-        findings.append(("Info", "Twitter card not set", "twitter:card missing.", "Add twitter:card (summary_large_image) for better previews."))
-
-    if h1s == 0:
-        findings.append(("Medium", "No H1 found on homepage", "No <h1> tag detected.", "Add a single H1 describing your main offer (keyword + value)."))
+        issues.append({"title": "Missing canonical link", "severity": "Low", "details": "Canonical helps avoid duplicate content issues."})
         score -= 10
-    elif h1s > 1:
-        findings.append(("Low", "Multiple H1 tags detected", f"H1 count: {h1s}", "Prefer a single H1 per page for clarity."))
-        score -= 4
+    if not h1:
+        issues.append({"title": "Missing H1 on homepage", "severity": "Low", "details": "A clear H1 helps structure and accessibility."})
+        score -= 10
+    if robots_meta and ("noindex" in robots_meta.lower()):
+        issues.append({"title": "robots meta contains noindex", "severity": "High", "details": f'robots="{robots_meta}" can prevent indexing.'})
+        score -= 25
 
-    if not schema_ok:
-        findings.append(("Low", "No structured data detected", "No JSON-LD / microdata found.", "Add JSON-LD (Organization, WebSite, Product/Service) for richer results."))
-        score -= 4
+    score = max(0, min(100, score))
+    return {
+        "score": score,
+        "title": title,
+        "meta_desc": meta_desc,
+        "canonical": canonical,
+        "robots": robots_meta,
+        "h1": h1,
+        "issues": issues
+    }
 
-    if img_n > 0:
-        coverage = int((img_with_alt / max(1, img_n)) * 100)
-        if coverage < 60:
-            findings.append(("Low", "Many images missing alt text (sample)", f"Sampled {img_n} images, alt coverage ~{coverage}%", "Add alt text for accessibility + image SEO."))
-            score -= 4
-        if img_empty_alt > 5:
-            findings.append(("Info", "Some images have empty alt", f"Empty alt count (sample): {img_empty_alt}", "Use empty alt only for decorative images; otherwise describe the image."))
+def score_security(sec: Dict[str, Any]) -> int:
+    # Simple scoring: missing headers reduce score
+    missing = sec.get("missing", [])
+    s = 100 - (len(missing) * 6)
+    return max(40, min(100, s))
 
-    score = max(5, min(100, score))
-    if not findings:
-        findings.append(("Low", "No obvious SEO issues detected (public scan)", "Title, description, canonical, and crawling basics look fine.", "Consider adding structured data + improving content depth for competitive keywords."))
+def score_performance(home_elapsed: float, html_len: int) -> int:
+    # Very simple proxy scoring (public-only)
+    s = 100
+    if home_elapsed > 2.0:
+        s -= 20
+    elif home_elapsed > 1.0:
+        s -= 10
+    if html_len > 500_000:
+        s -= 15
+    elif html_len > 200_000:
+        s -= 10
+    return max(40, min(100, s))
 
-    bullets = [
-        f"Title: {'present' if bool(title) else 'missing'}; Description: {'present' if bool(desc) else 'missing'}; Canonical: {'present' if bool(canonical) else 'missing'}",
-        f"robots.txt: {'OK' if r_code==200 else 'missing'}; sitemap.xml: {'OK' if s_code==200 else 'missing'}",
-        f"H1 tags: {h1s}; Structured data: {'found' if schema_ok else 'not found'}",
-    ]
+def score_maintainability(platform: str) -> int:
+    # Public-only maintainability is limited; we keep it high but not perfect
+    # because we can't inspect editor workflows/privacy rules unless exposed.
+    return 92 if platform == "Bubble" else 90
 
-    return score, bullets, findings
+def build_key_risks(scan: Dict[str, Any]) -> List[str]:
+    bullets = []
+    # endpoint accessibility signals
+    if scan["checks"].get("meta", {}).get("status") in (401, 403, 404, None):
+        bullets.append("Metadata endpoint does not appear publicly accessible (good baseline).")
+    else:
+        bullets.append("Metadata endpoint is publicly accessible — review exposure risk.")
 
+    if scan["checks"].get("swagger", {}).get("status") in (401, 403, 404, None):
+        bullets.append("Swagger schema not publicly accessible (good baseline).")
+    else:
+        bullets.append("Swagger schema appears public — your backend surface may be exposed.")
 
-def badge(sev: str):
-    return f'<span class="badge sev-{sev}">{sev}</span>'
+    sec_missing = scan["security"].get("missing", [])
+    if sec_missing:
+        bullets.append("Some recommended security headers are missing (CSP/HSTS/XFO etc.).")
+    else:
+        bullets.append("Recommended security headers look good on the homepage response.")
 
+    # SEO summary
+    seo_score = scan["seo"].get("score", 0)
+    if seo_score < 70:
+        bullets.append("SEO basics need attention (title/meta/canonical/H1).")
+    else:
+        bullets.append("SEO basics look decent (public homepage checks).")
 
-def section_header(title: str, score_value):
-    score_label = "N/A" if score_value == 0 else str(score_value)
-    st.markdown(
-        f"""
-<div class="card">
-  <div style="display:flex; align-items:center; justify-content:space-between; gap:12px;">
-    <h2 style="margin:0;">{title}</h2>
-    <span class="pill">{score_label}</span>
-  </div>
-</div>
-""",
-        unsafe_allow_html=True
-    )
+    return bullets
 
+def run_public_checks(base_url: str) -> Dict[str, Any]:
+    # Homepage
+    home_code, home_headers, home_html, home_elapsed, home_err = safe_get(base_url + "/")
 
-def render_items(items, gated: bool):
-    for sev, title, evidence, fix in items:
-        st.markdown(
-            f"""
-<div class="card2">
-  <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-    {badge(sev)}
-    <div style="font-weight:800;">{title}</div>
-  </div>
-  <div class="hr"></div>
-  <div class="small"><b>Evidence:</b></div>
-  <div class="evidence">{evidence}</div>
-  <div style="height:10px;"></div>
-  <div class="small"><b>Suggested fix:</b> {"(Unlock full fix plan in popup)" if gated else fix}</div>
-</div>
-""",
-            unsafe_allow_html=True
-        )
-        st.write("")
+    # Bubble-ish public endpoints (safe to try on any host)
+    meta_code, meta_headers, meta_html, meta_elapsed, meta_err = safe_get(base_url + "/api/1.1/meta")
+    swag_code, swag_headers, swag_html, swag_elapsed, swag_err = safe_get(base_url + "/swagger.json")
 
+    return {
+        "homepage": {"status": home_code, "elapsed": home_elapsed, "error": home_err, "headers": home_headers, "html": home_html},
+        "meta": {"status": meta_code, "elapsed": meta_elapsed, "error": meta_err},
+        "swagger": {"status": swag_code, "elapsed": swag_elapsed, "error": swag_err},
+    }
 
-# ---------------------------
-# SCANS
-# ---------------------------
-def stable_cache_key(platform: str, app_url: str, app_id: str, env: str):
-    s = f"{platform}|{normalize_url(app_url)}|{(app_id or '').strip()}|{env}"
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:18]
+def run_scan(platform: str, app_url: str, app_id: str, env: str) -> Dict[str, Any]:
+    # Resolve base URL
+    base = ""
+    if platform == "Bubble":
+        base = bubble_base_from_env(app_id.strip(), env, app_url.strip())
+    else:
+        base = normalize_url(app_url)
 
-
-@st.cache_data(show_spinner=False)
-def run_bubble_scan_cached(app_url: str, app_id: str, env: str, cache_key: str):
-    base = env_base_from_inputs(app_url, app_id, env)
     if not base:
-        return {"error": "Missing App URL or Bubble App ID."}
+        return {"error": "Could not determine a valid base URL. Please enter a valid App URL."}
 
-    steps = []
+    checks = run_public_checks(base)
+    home = checks["homepage"]
 
-    home_url = base + "/"
-    code, headers, html, _, elapsed, err = safe_get(home_url)
-    steps.append(("Fetch homepage", home_url, code, elapsed, err))
-    home_blocked = code in (401, 403)
+    if home.get("status") is None:
+        return {"error": "Failed to fetch homepage (network error). Please try again."}
 
-    title = find_title(html) if (html and not home_blocked) else ((app_id.strip() if app_id else "Bubble App"))
-    og_img = find_og_image(html, base) if (html and not home_blocked) else ""
-    favicon = find_favicon(html, base) if (html and not home_blocked) else urljoin(base + "/", "favicon.ico")
-    logo_url = og_img if og_img else favicon
+    # favicon / logo
+    favicon = detect_favicon(base)
 
-    header_score, _, header_missing = score_headers(headers or {})
+    # security
+    sec = check_security_headers(home.get("headers", {}))
 
-    meta_url = base + "/api/1.1/meta"
-    m_code, _, _, m_json, m_elapsed, m_err = safe_get(meta_url)
-    steps.append(("Fetch /api/1.1/meta", meta_url, m_code, m_elapsed, m_err))
-    meta_exposed = (m_code == 200 and isinstance(m_json, dict))
-
-    swagger_url = base + "/api/1.1/meta/swagger.json"
-    s_code, _, _, s_json, s_elapsed, s_err = safe_get(swagger_url)
-    steps.append(("Fetch swagger.json", swagger_url, s_code, s_elapsed, s_err))
-    swagger_exposed = (s_code == 200 and isinstance(s_json, dict))
-
-    swagger_paths = 0
-    swagger_samples = []
-    if swagger_exposed:
-        swagger_paths, _, swagger_samples = extract_swagger_stats(s_json)
-
-    admin_candidates = ["/admin", "/dashboard", "/settings", "/super_admin", "/superadmin", "/backend", "/login"]
-    probe = probe_paths(base, admin_candidates)
-
-    html_kb = int(len(html.encode("utf-8")) / 1024) if (html and not home_blocked) else None
-    script_count = len(re.findall(r"<script\b", html or "", re.I)) if (html and not home_blocked) else None
+    # performance (public proxy)
+    perf_issues = []
+    html_len = len(home.get("html") or "")
+    perf_issues.append({
+        "title": "Homepage payload snapshot",
+        "severity": "Info",
+        "details": f"HTML size ≈ {round(html_len/1024, 1)} KB, response time ≈ {round(home.get('elapsed', 0.0)*1000)} ms."
+    })
+    perf_issues.extend(check_cache_headers(home.get("headers", {})).get("issues", []))
 
     # SEO
-    if home_blocked or not html:
-        seo_score = 0
-        seo_bullets = ["SEO checks limited because homepage HTML is not publicly accessible (401/403)."]
-        seo_findings = [("Info", "SEO checks limited", f"GET {home_url} → {code}", "Make a public marketing page for accurate SEO checks.")]
-    else:
-        seo_score, seo_bullets, seo_findings = build_seo_findings(base, html, headers or {})
+    seo = check_seo(home.get("html") or "")
 
     # Scores
-    sec = 100
-    sec -= int((100 - header_score) * 0.45)
-    if meta_exposed:
-        sec -= 18
-    if swagger_exposed:
-        sec -= 12
-    if home_blocked:
-        sec += 6
-    sec = max(5, min(100, sec))
+    s_security = score_security(sec)
+    s_perf = score_performance(home.get("elapsed", 0.0), html_len)
+    s_maint = score_maintainability(platform)
 
-    if home_blocked or html_kb is None:
-        perf = 0
-    else:
-        perf = 100
-        if html_kb > 900:
-            perf -= 18
-        elif html_kb > 500:
-            perf -= 10
-        if script_count and script_count > 40:
-            perf -= 12
-        elif script_count and script_count > 25:
-            perf -= 7
-        perf = max(10, min(100, perf))
-
-    maint = 100
-    if swagger_exposed:
-        maint -= 10
-    maint = max(10, min(100, maint))
-
-    seo = seo_score
-
-    # Key bullets
-    key_bullets = [
-        "This is a public scan (no API key). Private editor rules/workflows are not accessible.",
-        "Public metadata + swagger exposure can reveal your API surface area.",
-        f"Security headers missing: {', '.join(header_missing) if header_missing else 'none detected'}",
-    ]
-    if perf == 0:
-        key_bullets.append("Performance snapshot limited because the homepage isn’t publicly accessible.")
-    else:
-        key_bullets.append(f"Homepage snapshot: ~{html_kb} KB HTML and ~{script_count} script tags.")
-    key_bullets.extend(seo_bullets[:2])
-
-    # Findings
-    findings_security = []
-    if meta_exposed:
-        findings_security.append(("High", "Public /api/1.1/meta is accessible", f"GET {meta_url} → 200", "Restrict metadata exposure if it reveals sensitive structure."))
-    if swagger_exposed:
-        findings_security.append(("Medium", "Public swagger schema is accessible", f"GET {swagger_url} → 200 ({swagger_paths} paths)", "Ensure API auth is strict; hide swagger if not needed."))
-    if header_missing:
-        findings_security.append(("Medium", "Missing recommended security headers", "Missing: " + ", ".join(header_missing), "Add CSP/HSTS/XFO/Referrer/Permissions policies at CDN/proxy."))
-    if not findings_security:
-        findings_security.append(("Low", "No major public security red flags detected", "Public endpoints did not expose meta/swagger and headers look reasonable.", "Do a deeper audit if you handle sensitive data."))
-
-    findings_perf = []
-    if perf == 0:
-        findings_perf.append(("Info", "Performance details limited", f"GET {home_url} → {code}", "Share a public page for deeper checks."))
-    else:
-        findings_perf.append(("Info", "Homepage payload snapshot", f"HTML ≈ {html_kb} KB, scripts ≈ {script_count}", "Reduce plugin bloat; defer heavy scripts; avoid workflows on load."))
-
-    findings_maint = []
-    if swagger_exposed and swagger_samples:
-        findings_maint.append(("Info", "Public API surface snapshot (sample paths)", "Sample: " + ", ".join(swagger_samples[:10]) + ("..." if len(swagger_samples) > 10 else ""), "Document endpoints; standardize auth + naming patterns."))
-    else:
-        findings_maint.append(("Info", "Maintainability detail limited (public scan)", "No public swagger/meta available, or access restricted.", "Full audit needs editor access (workflows, data types, privacy rules)."))
-
-    return {
-        "platform": "Bubble",
-        "base": base,
-        "title": title,
-        "logo_url": logo_url,
-        "home_url": home_url,
-        "steps": steps,
-        "scores": {"security": sec, "performance": perf, "maintainability": maint, "seo": seo},
-        "key_bullets": key_bullets,
-        "findings": {
-            "security": findings_security,
-            "performance": findings_perf,
-            "maintainability": findings_maint,
-            "seo": seo_findings,
+    scan = {
+        "input": {
+            "platform": platform,
+            "app_url": normalize_url(app_url),
+            "app_id": app_id.strip(),
+            "env": env,
+            "base": base
         },
-        "evidence": build_evidence_lines(steps, probe=probe),
-    }
-
-
-@st.cache_data(show_spinner=False)
-def run_lovable_scan_cached(app_url: str, cache_key: str):
-    base = normalize_url(app_url)
-    if not base or not is_valid_url(base):
-        return {"error": "Please enter a valid Lovable app URL (must include domain)."}
-
-    steps = []
-    home_url = base + "/"
-    code, headers, html, _, elapsed, err = safe_get(home_url)
-    steps.append(("Fetch homepage", home_url, code, elapsed, err))
-    home_blocked = code in (401, 403)
-
-    title = find_title(html) if (html and not home_blocked) else "Lovable App"
-    og_img = find_og_image(html, base) if (html and not home_blocked) else ""
-    favicon = find_favicon(html, base) if (html and not home_blocked) else urljoin(base + "/", "favicon.ico")
-    logo_url = og_img if og_img else favicon
-
-    header_score, _, header_missing = score_headers(headers or {})
-
-    html_kb = int(len(html.encode("utf-8")) / 1024) if (html and not home_blocked) else None
-    script_count = len(re.findall(r"<script\b", html or "", re.I)) if (html and not home_blocked) else None
-
-    # Public exposure probes (generic web)
-    probe_paths_list = ["/.env", "/env", "/server-status", "/.git/config", "/sitemap.xml", "/robots.txt"]
-    probe = probe_paths(base, probe_paths_list)
-
-    # SEO
-    if home_blocked or not html:
-        seo_score = 0
-        seo_bullets = ["SEO checks limited because homepage HTML is not publicly accessible (401/403)."]
-        seo_findings = [("Info", "SEO checks limited", f"GET {home_url} → {code}", "Make sure your marketing page is public to validate SEO.")]
-    else:
-        seo_score, seo_bullets, seo_findings = build_seo_findings(base, html, headers or {})
-
-    # Scores
-    sec = 100
-    sec -= int((100 - header_score) * 0.55)
-    if home_blocked:
-        sec += 4
-    # If sensitive paths respond 200, reduce security
-    exposed_hits = [p for p in probe if p.get("status") == 200]
-    if exposed_hits:
-        sec -= 18
-    sec = max(5, min(100, sec))
-
-    if home_blocked or html_kb is None:
-        perf = 0
-    else:
-        perf = 100
-        if html_kb > 900:
-            perf -= 18
-        elif html_kb > 500:
-            perf -= 10
-        if script_count and script_count > 40:
-            perf -= 12
-        elif script_count and script_count > 25:
-            perf -= 7
-        perf = max(10, min(100, perf))
-
-    maint = 85  # Lovable: public scan can’t infer internal architecture
-    seo = seo_score
-
-    key_bullets = [
-        "Lovable audit uses public web checks (headers, SEO, payload size).",
-        f"Security headers missing: {', '.join(header_missing) if header_missing else 'none detected'}",
-    ]
-    if exposed_hits:
-        key_bullets.append("Some sensitive/common files appear publicly accessible (needs review).")
-    else:
-        key_bullets.append("No obvious sensitive file exposure detected in basic probes.")
-    if perf == 0:
-        key_bullets.append("Performance snapshot limited because the homepage isn’t publicly accessible.")
-    else:
-        key_bullets.append(f"Homepage snapshot: ~{html_kb} KB HTML and ~{script_count} script tags.")
-    key_bullets.extend(seo_bullets[:2])
-
-    findings_security = []
-    if header_missing:
-        findings_security.append(("Medium", "Missing recommended security headers", "Missing: " + ", ".join(header_missing), "Add CSP/HSTS/XFO/Referrer/Permissions policies at CDN/proxy."))
-    if exposed_hits:
-        examples = ", ".join([e["path"] for e in exposed_hits[:5]])
-        findings_security.append(("High", "Potential sensitive file exposure", f"200 OK on: {examples}", "Block access to config/debug files and review deployment rules."))
-    if not findings_security:
-        findings_security.append(("Low", "No major public security red flags detected", "Headers look reasonable and no obvious sensitive file exposure in basic probes.", "Consider deeper review if handling auth, payments, or PII."))
-
-    findings_perf = []
-    if perf == 0:
-        findings_perf.append(("Info", "Performance details limited", f"GET {home_url} → {code}", "Make sure the marketing/home page is public for accurate checks."))
-    else:
-        findings_perf.append(("Info", "Homepage payload snapshot", f"HTML ≈ {html_kb} KB, scripts ≈ {script_count}", "Reduce heavy bundles; lazy-load non-critical components."))
-
-    findings_maint = [
-        ("Info", "Maintainability is limited in a public scan", "We can’t see internal components, data models, or build setup publicly.", "Share repo or staging access for a deeper architecture review.")
-    ]
-
-    return {
-        "platform": "Lovable",
-        "base": base,
-        "title": title,
-        "logo_url": logo_url,
-        "home_url": home_url,
-        "steps": steps,
-        "scores": {"security": sec, "performance": perf, "maintainability": maint, "seo": seo},
-        "key_bullets": key_bullets,
-        "findings": {
-            "security": findings_security,
-            "performance": findings_perf,
-            "maintainability": findings_maint,
-            "seo": seo_findings,
+        "app": {
+            "name": (app_id.strip() or urlparse(base).netloc.split(":")[0]).strip() or "App",
+            "favicon": favicon
         },
-        "evidence": build_evidence_lines(steps, probe=probe),
+        "checks": {
+            "homepage": {"status": home.get("status"), "elapsed": home.get("elapsed")},
+            "meta": {"status": checks["meta"].get("status"), "elapsed": checks["meta"].get("elapsed")},
+            "swagger": {"status": checks["swagger"].get("status"), "elapsed": checks["swagger"].get("elapsed")},
+        },
+        "security": sec,
+        "performance": {"issues": perf_issues},
+        "maintainability": {"issues": [{
+            "title": "Public scan limitation",
+            "severity": "Info",
+            "details": "This is a public scan. It cannot directly read Bubble editor privacy rules or workflow logic unless they are publicly exposed."
+        }]},
+        "seo": seo,
+        "scores": {
+            "security": s_security,
+            "performance": s_perf,
+            "maintainability": s_maint
+        }
     }
+    scan["key_risks"] = build_key_risks(scan)
+    return scan
 
+# -----------------------------
+# UI HELPERS
+# -----------------------------
+def pill(sev: str) -> str:
+    sev = (sev or "").lower()
+    if sev == "high":
+        return "🔴 High"
+    if sev == "medium":
+        return "🟠 Medium"
+    if sev == "low":
+        return "🟢 Low"
+    return "🔵 Info"
 
-def run_scan(platform: str, app_url: str, app_id: str, env: str):
-    ck = stable_cache_key(platform, app_url, app_id, env)
-    if platform == "Bubble":
-        return run_bubble_scan_cached(app_url, app_id, env, ck)
-    return run_lovable_scan_cached(app_url, ck)
-
-
-# ---------------------------
-# HEADER
-# ---------------------------
-st.markdown("## App Auditor")
-st.markdown('<div class="small">Pick a platform, run a public scan, then unlock fixes + book a call.</div>', unsafe_allow_html=True)
-st.write("")
-
-
-# ---------------------------
-# INPUTS
-# ---------------------------
-platform = st.radio("Choose audit type", ["Bubble", "Lovable"], horizontal=True)
-
-c1, c2, c3 = st.columns([0.44, 0.28, 0.28])
-
-with c1:
-    app_url = st.text_input("App URL", placeholder="yourapp.com or https://yourapp.bubbleapps.io")
-with c2:
-    if platform == "Bubble":
-        app_id = st.text_input("Bubble App ID (recommended)", placeholder="yourapp-28503")
+def status_line(label: str, status: Optional[int], ms: Optional[float]) -> str:
+    s = "—"
+    if status is None:
+        s = "ERR"
     else:
-        app_id = ""
-        st.text_input("Lovable App ID", value="Not required", disabled=True)
-with c3:
-    if platform == "Bubble":
+        s = str(status)
+    t = ""
+    if ms is not None:
+        t = f"{int(ms*1000)}ms"
+    return f"{label} — {s} — {t}"
+
+def issue_block(title: str, sev: str, details: str):
+    st.markdown(f"**{pill(sev)} {title}**")
+    st.caption(details)
+
+def init_state():
+    if "last_scan" not in st.session_state:
+        st.session_state["last_scan"] = None
+    if "lead_unlocked" not in st.session_state:
+        st.session_state["lead_unlocked"] = False
+    if "lead_step" not in st.session_state:
+        st.session_state["lead_step"] = "form"  # form | calendly
+    if "last_fingerprint" not in st.session_state:
+        st.session_state["last_fingerprint"] = ""
+
+# -----------------------------
+# STREAMLIT PAGE
+# -----------------------------
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+init_state()
+
+# Basic dark styling
+st.markdown(
+    """
+    <style>
+      .block-container { padding-top: 2rem; }
+      .stApp { background: #0b0f14; color: #eaeef6; }
+      h1, h2, h3 { color: #eaeef6; }
+      .muted { color: rgba(234,238,246,.7); }
+      .card {
+        background: rgba(255,255,255,.04);
+        border: 1px solid rgba(255,255,255,.08);
+        border-radius: 18px;
+        padding: 16px;
+      }
+      .big { font-size: 44px; font-weight: 800; margin: 0; }
+      .label { font-size: 13px; opacity: .75; margin: 0; }
+      .scorebox { display:flex; gap:18px; flex-wrap:wrap; }
+      .scoreitem { min-width: 180px; }
+      .barwrap {
+        background: rgba(255,255,255,.06);
+        border-radius: 999px;
+        padding: 6px;
+        border: 1px solid rgba(255,255,255,.08);
+      }
+      .barfill {
+        height: 12px;
+        border-radius: 999px;
+        background: linear-gradient(90deg, #7c3aed, #ec4899);
+        width: 50%;
+      }
+      .tiny { font-size: 12px; opacity:.75;}
+      .btnPrimary button { background: #ff3b3b !important; border: none !important; }
+      iframe { border-radius: 14px; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# Header
+left, right = st.columns([1, 2], gap="large")
+with left:
+    st.markdown(f"# {APP_TITLE}")
+    st.markdown('<div class="muted">Public scan for Bubble and Lovable apps. No editor access required.</div>', unsafe_allow_html=True)
+
+# Input bar
+with right:
+    c1, c2, c3 = st.columns([1.1, 1, 0.7])
+    with c1:
+        platform = st.selectbox("Platform", ["Bubble", "Lovable"], index=0)
+        app_url = st.text_input("App URL", placeholder="https://yourapp.com or yourapp.bubbleapps.io")
+    with c2:
+        if platform == "Bubble":
+            app_id = st.text_input("Bubble App ID", placeholder="yourapp-28503 (optional)")
+        else:
+            app_id = st.text_input("Lovable App ID", placeholder="Not required", disabled=True, value="")
+    with c3:
         env = st.selectbox("Environment", ["live", "version-test"], index=0)
-    else:
-        env = "live"
-        st.selectbox("Environment", ["live"], index=0, disabled=True)
+    run_btn = st.button("Run scan", type="primary", use_container_width=True)
 
-run_btn = st.button("Run scan", type="primary", use_container_width=True)
-
+# Reset unlock when inputs change
 fingerprint = stable_cache_key(platform, app_url, app_id, env)
 if st.session_state.get("last_fingerprint") != fingerprint:
     st.session_state["lead_unlocked"] = False
+    st.session_state["lead_step"] = "form"
     st.session_state["last_fingerprint"] = fingerprint
 
-if "lead_step" not in st.session_state:
-    st.session_state["lead_step"] = "form"   # form | calendly
+# ✅ VALIDATE ONLY WHEN CLICKING RUN
+if run_btn:
+    if platform == "Bubble":
+        if not (app_url.strip() or app_id.strip()):
+            st.error("Please enter either App URL or Bubble App ID.")
+            st.stop()
 
-if not run_btn and "last_scan" not in st.session_state:
+        if app_id.strip() and not is_valid_bubble_app_id(app_id):
+            st.error("Bubble App ID looks invalid. Example: yourapp-28503")
+            st.stop()
+
+        if app_url.strip():
+            ok, msg = quick_access_check(app_url)
+            if not ok:
+                st.error(msg)
+                st.stop()
+            if ok and msg != "OK":
+                st.warning(msg)
+
+    else:
+        if not app_url.strip():
+            st.error("Please enter the Lovable App URL.")
+            st.stop()
+
+        ok, msg = quick_access_check(app_url)
+        if not ok:
+            st.error(msg)
+            st.stop()
+        if ok and msg != "OK":
+            st.warning(msg)
+
+# Only run scan if button clicked OR last_scan exists
+if not run_btn and st.session_state.get("last_scan") is None:
     st.info("Choose Bubble or Lovable, enter the URL (Bubble: ID optional), then click **Run scan**.")
     st.stop()
 
-
-# ---------------------------
-# RUN SCAN
-# ---------------------------
-if run_btn or "last_scan" in st.session_state:
-    base_url = normalize_url(app_url)
-    if not base_url:
-        st.error("Please enter the App URL.")
-        st.stop()
-
+# Run scan
+if run_btn or st.session_state.get("last_scan") is not None:
     prog = st.progress(0)
     status = st.empty()
     status.info("Starting scan…")
-    prog.progress(25)
+    prog.progress(20)
 
     status.info("Fetching and analyzing public endpoints…")
-    prog.progress(70)
+    prog.progress(65)
 
     scan = run_scan(platform, app_url, app_id, env)
     if scan.get("error"):
@@ -803,190 +562,181 @@ if run_btn or "last_scan" in st.session_state:
 else:
     scan = st.session_state.get("last_scan")
 
+# -----------------------------
+# RESULTS LAYOUT
+# -----------------------------
+scan = st.session_state.get("last_scan")
+if not scan:
+    st.stop()
 
-# ---------------------------
-# LAYOUT
-# ---------------------------
-L, R = st.columns([0.36, 0.64], gap="large")
+L, R = st.columns([1, 2], gap="large")
 
+# LEFT SIDEBAR (like NQU)
 with L:
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    if scan.get("logo_url"):
-        st.image(scan["logo_url"], width=72)
 
-    st.markdown(f"### {scan.get('title','App')}")
-    st.markdown(f'<div class="small">{scan.get("platform","")}</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="small">{scan.get("base","")}</div>', unsafe_allow_html=True)
+    # app icon/name
+    ico = scan["app"].get("favicon")
+    name = scan["app"].get("name", "App")
+    base = scan["input"]["base"]
 
-    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
-    st.markdown("**Audit status**")
-    for (name, url, code, elapsed, err) in scan.get("steps", []):
-        ok = (code == 200)
-        icon = "✅" if ok else ("⚠️" if code else "❌")
-        ms = f"{int(elapsed*1000)}ms"
-        if code is None:
-            st.write(f"{icon} {name} — {ms}")
-        else:
-            st.write(f"{icon} {name} — {code} — {ms}")
+    if ico:
+        st.image(ico, width=36)
+    st.markdown(f"## {name}")
+    st.caption(base)
 
-    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
+    st.markdown("### Audit Complete")
+    st.markdown(
+        f"- ⚠️ {status_line('Fetch homepage', scan['checks']['homepage']['status'], scan['checks']['homepage']['elapsed'])}\n"
+        f"- ⚠️ {status_line('Fetch /api/1.1/meta', scan['checks']['meta']['status'], scan['checks']['meta']['elapsed'])}\n"
+        f"- ⚠️ {status_line('Fetch swagger.json', scan['checks']['swagger']['status'], scan['checks']['swagger']['elapsed'])}"
+    )
 
-    s = scan["scores"]["security"]
-    p = scan["scores"]["performance"]
-    m = scan["scores"]["maintainability"]
-    seo = scan["scores"]["seo"]
-
-    k1, k2 = st.columns(2)
-    with k1:
-        st.markdown('<div class="kpi">', unsafe_allow_html=True)
-        st.markdown("**Security**")
-        st.markdown(f"<h2 style='margin:0;'>{s}</h2>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-    with k2:
-        st.markdown('<div class="kpi">', unsafe_allow_html=True)
-        st.markdown("**Performance**")
-        st.markdown(f"<h2 style='margin:0;'>{'N/A' if p==0 else p}</h2>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    k3, k4 = st.columns(2)
-    with k3:
-        st.markdown('<div class="kpi">', unsafe_allow_html=True)
-        st.markdown("**Maintainability**")
-        st.markdown(f"<h2 style='margin:0;'>{m}</h2>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-    with k4:
-        st.markdown('<div class="kpi">', unsafe_allow_html=True)
-        st.markdown("**SEO**")
-        st.markdown(f"<h2 style='margin:0;'>{'N/A' if seo==0 else seo}</h2>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
-    st.caption("Note: Public scans can’t see private editor settings, internal DB rules, or workflow logic.")
+    st.markdown("### Scores")
+    st.markdown('<div class="scorebox">', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="scoreitem"><p class="label">Security</p><p class="big">{scan["scores"]["security"]}</p></div>',
+        unsafe_allow_html=True
+    )
+    st.markdown(
+        f'<div class="scoreitem"><p class="label">Performance</p><p class="big">{scan["scores"]["performance"]}</p></div>',
+        unsafe_allow_html=True
+    )
+    st.markdown(
+        f'<div class="scoreitem"><p class="label">Maintainability</p><p class="big">{scan["scores"]["maintainability"]}</p></div>',
+        unsafe_allow_html=True
+    )
+    st.markdown(
+        f'<div class="scoreitem"><p class="label">SEO</p><p class="big">{scan["seo"]["score"]}</p></div>',
+        unsafe_allow_html=True
+    )
     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.write("")
-    with st.expander("View evidence log"):
-        st.code(scan.get("evidence", ""), language="text")
+    st.caption("Note: This is a public scan. It cannot directly read editor privacy rules or workflow logic unless they are publicly exposed.")
 
+    # CTA
+    st.markdown("---")
+    if not st.session_state["lead_unlocked"]:
+        st.markdown("### Want the actionable fix plan?")
+        st.caption("Unlock the step-by-step recommendations and I’ll walk you through the fastest wins first.")
+        if st.button("Unlock report + book a 30-min review", use_container_width=True):
+            st.session_state["show_modal"] = True
+    else:
+        st.success("Unlocked ✅ Open the booking modal to schedule.")
+        if st.button("Open booking", use_container_width=True):
+            st.session_state["show_modal"] = True
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# RIGHT MAIN CONTENT
 with R:
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("### Key risks and focus areas")
-    for b in scan.get("key_bullets", [])[:8]:
-        st.write(f"• {b}")
+    st.markdown("## Key risks and focus areas")
+    for b in scan.get("key_risks", []):
+        st.markdown(f"- {b}")
     st.markdown("</div>", unsafe_allow_html=True)
-    st.write("")
-
-    unlocked = bool(st.session_state.get("lead_unlocked", False))
-    gated = not unlocked
-
-    section_header("Security", scan["scores"]["security"])
-    st.write("")
-    render_items(scan["findings"]["security"], gated=gated)
-
-    section_header("Performance", scan["scores"]["performance"])
-    st.write("")
-    render_items(scan["findings"]["performance"], gated=gated)
-
-    section_header("Maintainability", scan["scores"]["maintainability"])
-    st.write("")
-    render_items(scan["findings"]["maintainability"], gated=gated)
-
-    section_header("SEO", scan["scores"]["seo"])
-    st.write("")
-    render_items(scan["findings"]["seo"], gated=gated)
 
     st.write("")
-    open_popup = st.button("Unlock full fix plan + book a call", type="primary", use_container_width=True)
 
+    # SECURITY
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    s = scan["scores"]["security"]
+    st.markdown(f"## Security")
+    st.markdown(f'<div class="barwrap"><div class="barfill" style="width:{s}%;"></div></div>', unsafe_allow_html=True)
+    st.caption(f"Score: {s}")
 
-# ---------------------------
-# MODAL POPUP (FORM OR CALENDLY, NOT BOTH)
-# ---------------------------
-modal = Modal(title="Unlock full Fix Plan + Book a 30-min call", key="unlock_modal", max_width=820)
+    for it in scan["security"].get("issues", []):
+        issue_block(it["title"], it["severity"], it["details"])
+        st.write("")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-if open_popup:
-    modal.open()
-    st.session_state["lead_step"] = "form" if not st.session_state.get("lead_unlocked", False) else "calendly"
+    st.write("")
 
-if modal.is_open():
-    with modal.container():
-        st.components.v1.html(
-            """
-<script>
-setTimeout(() => {
-  const el = window.parent.document.querySelector('section.main');
-  if(el) el.scrollTo({top: 0, behavior: 'smooth'});
-}, 60);
-</script>
-""",
-            height=0
-        )
+    # PERFORMANCE
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    p = scan["scores"]["performance"]
+    st.markdown("## Performance")
+    st.markdown(f'<div class="barwrap"><div class="barfill" style="width:{p}%;"></div></div>', unsafe_allow_html=True)
+    st.caption(f"Score: {p}")
 
-        if st.session_state.get("lead_step") == "form":
-            st.markdown(
-                """
-<div class="cta">
-  <h3 style="margin:0;">What you’ll get</h3>
-  <div class="small" style="margin-top:8px;">
-    A clear action plan: what to fix first, how to fix it, and what to ignore.
-  </div>
-  <div class="hr"></div>
-  <div style="display:flex; gap:10px; flex-wrap:wrap;">
-    <span class="pill">✅ Prioritized fix list</span>
-    <span class="pill">✅ Security hardening checklist</span>
-    <span class="pill">✅ Performance cleanup plan</span>
-    <span class="pill">✅ SEO quick wins</span>
-  </div>
-</div>
-""",
-                unsafe_allow_html=True
-            )
-            st.write("")
-            st.markdown("#### Enter details to unlock full fixes")
+    for it in scan["performance"].get("issues", []):
+        issue_block(it["title"], it["severity"], it["details"])
+        st.write("")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-            with st.form("lead_form_modal", clear_on_submit=False):
-                c1, c2 = st.columns(2)
-                with c1:
-                    name = st.text_input("Your name")
-                    email = st.text_input("Email")
-                    role = st.selectbox("Your role", ["Founder", "Developer", "Product", "Agency", "Other"])
-                with c2:
-                    company = st.text_input("Company (optional)")
-                    timeline = st.selectbox("Timeline", ["ASAP (this week)", "This month", "Next 1–3 months", "Just exploring"])
-                    notes = st.text_area("What should I know? (optional)", placeholder="e.g. auth, payments, user files, SEO goals, etc.")
+    st.write("")
 
-                submitted = st.form_submit_button("Unlock + Continue to booking", type="primary", use_container_width=True)
+    # SEO
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    seo_score = scan["seo"]["score"]
+    st.markdown("## SEO")
+    st.markdown(f'<div class="barwrap"><div class="barfill" style="width:{seo_score}%;"></div></div>', unsafe_allow_html=True)
+    st.caption(f"Score: {seo_score}")
 
-            if submitted:
-                st.session_state["lead_unlocked"] = True
-                st.session_state["lead_step"] = "calendly"
-                st.success("Unlocked ✅ Loading booking…")
-                st.rerun()
+    # show key fields
+    st.markdown(f"**Title:** {scan['seo'].get('title') or '—'}")
+    st.markdown(f"**Meta description:** {scan['seo'].get('meta_desc') or '—'}")
+    st.markdown(f"**Canonical:** {scan['seo'].get('canonical') or '—'}")
+    st.markdown(f"**Robots:** {scan['seo'].get('robots') or '—'}")
+    st.markdown(f"**H1:** {scan['seo'].get('h1') or '—'}")
+    st.write("")
 
-        else:
-            st.markdown("### Book your 30-minute meeting")
-            st.markdown('<div class="small">I’ll review your scan and point out the fastest wins first.</div>', unsafe_allow_html=True)
-            st.write("")
+    for it in scan["seo"].get("issues", []):
+        issue_block(it["title"], it["severity"], it["details"])
+        st.write("")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-            st.components.v1.html(
-                f"""
-<div style="border:1px solid rgba(255,255,255,0.10); border-radius:18px; overflow:hidden; background: rgba(255,255,255,0.04);">
-  <iframe src="{CALENDLY_URL}" width="100%" height="720" frameborder="0"></iframe>
-</div>
-""",
-                height=760
-            )
+    st.write("")
 
-            c1, c2, c3 = st.columns([1, 1, 1])
-            with c1:
-                if st.button("Back", use_container_width=True):
-                    st.session_state["lead_step"] = "form"
-                    st.rerun()
-            with c2:
-                if st.button("Close", use_container_width=True):
-                    modal.close()
-            with c3:
-                if st.button("Start over", use_container_width=True):
-                    st.session_state["lead_unlocked"] = False
-                    st.session_state["lead_step"] = "form"
-                    modal.close()
+    # MAINTAINABILITY
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    m = scan["scores"]["maintainability"]
+    st.markdown("## Maintainability")
+    st.markdown(f'<div class="barwrap"><div class="barfill" style="width:{m}%;"></div></div>', unsafe_allow_html=True)
+    st.caption(f"Score: {m}")
+    for it in scan["maintainability"].get("issues", []):
+        issue_block(it["title"], it["severity"], it["details"])
+        st.write("")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# -----------------------------
+# MODAL (POPUP) LEAD + CALENDLY
+# -----------------------------
+if "show_modal" not in st.session_state:
+    st.session_state["show_modal"] = False
+
+@st.dialog("Unlock the report", width="large")
+def unlock_modal():
+    st.markdown("### Get the fix plan + fastest wins")
+    st.caption("Tell me a bit about your app and I’ll review your scan and show you the quickest improvements first.")
+    colA, colB = st.columns(2)
+
+    with colA:
+        name = st.text_input("Name", placeholder="Your name")
+        email = st.text_input("Email", placeholder="you@company.com")
+        role = st.selectbox("Your role", ["Founder", "Developer", "Product", "Ops", "Other"])
+    with colB:
+        timeline = st.selectbox("Timeline", ["ASAP (this week)", "Next 2 weeks", "This month", "Exploring"])
+        notes = st.text_area("What should I know? (optional)", placeholder="e.g. marketplace, user files, paid plans, etc.")
+
+    st.write("")
+    if not st.session_state["lead_unlocked"]:
+        if st.button("Unlock + Continue to booking", use_container_width=True):
+            if not email.strip() or "@" not in email:
+                st.error("Please enter a valid email to continue.")
+                st.stop()
+            st.session_state["lead_unlocked"] = True
+            st.session_state["lead_step"] = "calendly"
+            st.rerun()
+    else:
+        st.success("Unlocked ✅ Now pick a meeting time below.")
+
+    if st.session_state["lead_unlocked"] and st.session_state["lead_step"] == "calendly":
+        st.markdown("## Book your 30-minute meeting")
+        st.caption("I’ll review your scan and point out the fastest wins first.")
+        st.components.v1.iframe(CALENDLY_URL, height=760, scrolling=True)
+
+# Open modal when user requests
+if st.session_state.get("show_modal"):
+    unlock_modal()
+    st.session_state["show_modal"] = False
