@@ -15,7 +15,7 @@ CALENDLY_URL = "https://calendly.com/tassawarhussain/30min"
 REQUEST_TIMEOUT = 12
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "BubbleAppAuditor/2.2 (+public-scan)"})
+SESSION.headers.update({"User-Agent": "BubbleAppAuditor/2.3 (+public-scan)"})
 
 
 # ---------------------------
@@ -31,7 +31,6 @@ st.markdown(
   --card2: rgba(255,255,255,0.04);
   --stroke: rgba(255,255,255,0.10);
   --muted: rgba(255,255,255,0.72);
-  --muted2: rgba(255,255,255,0.60);
   --accent: #b36bff;
   --accent2: #7c5cff;
   --good: #32d583;
@@ -42,7 +41,6 @@ st.markdown(
 .block-container {padding-top: 1.2rem;}
 h1, h2, h3 {letter-spacing: -0.02em;}
 .small {font-size: 13px; color: var(--muted);}
-.muted {color: var(--muted);}
 .card{
   border: 1px solid var(--stroke);
   border-radius: 18px;
@@ -290,10 +288,8 @@ def h1_count(html: str):
 
 
 def has_structured_data(html: str):
-    # JSON-LD
     if re.search(r'<script[^>]+type=["\']application/ld\+json["\']', html, re.I):
         return True
-    # microdata signals
     if re.search(r'itemscope|itemtype=', html, re.I):
         return True
     return False
@@ -331,20 +327,17 @@ def build_seo_findings(base: str, home_html: str, home_headers: dict):
     schema_ok = has_structured_data(home_html)
     img_n, img_with_alt, img_empty_alt = image_alt_sample_stats(home_html)
 
-    # robots.txt and sitemap.xml
     robots_url = urljoin(base + "/", "robots.txt")
     sitemap_url = urljoin(base + "/", "sitemap.xml")
     r_code, _, r_txt, _, _, _ = safe_get(robots_url)
     s_code, _, s_txt, _, _, _ = safe_get(sitemap_url)
 
-    # indexability hint from headers
     x_robots = ""
     for hk, hv in (home_headers or {}).items():
         if hk.lower() == "x-robots-tag":
             x_robots = hv.strip()
             break
 
-    # TITLE
     if not title:
         findings.append(("High", "Missing <title> tag", "No title found on homepage HTML.", "Add a unique title (50–60 chars) describing the page + brand."))
         score -= 18
@@ -352,7 +345,6 @@ def build_seo_findings(base: str, home_html: str, home_headers: dict):
         findings.append(("Medium", "Title looks too short", f"Title: {title}", "Expand title to be descriptive (include key product keyword + brand)."))
         score -= 8
 
-    # META DESCRIPTION
     if not desc:
         findings.append(("Medium", "Missing meta description", "No meta description found.", "Add a 140–160 char description that sells the value + includes keyword."))
         score -= 10
@@ -360,12 +352,10 @@ def build_seo_findings(base: str, home_html: str, home_headers: dict):
         findings.append(("Low", "Meta description is very short", f"Description: {desc}", "Expand description to improve CTR on search results."))
         score -= 4
 
-    # CANONICAL
     if not canonical:
         findings.append(("Medium", "Missing canonical URL", "No rel=canonical found.", "Add canonical to avoid duplicate URL indexing issues."))
         score -= 8
 
-    # ROBOTS META / X-ROBOTS-TAG
     block_signals = []
     if robots_meta and ("noindex" in robots_meta.lower() or "nofollow" in robots_meta.lower()):
         block_signals.append(f'meta robots="{robots_meta}"')
@@ -375,7 +365,6 @@ def build_seo_findings(base: str, home_html: str, home_headers: dict):
         findings.append(("High", "Indexing may be blocked", " | ".join(block_signals), "Remove noindex/nofollow on public pages you want to rank."))
         score -= 20
 
-    # ROBOTS.TXT
     if r_code != 200:
         findings.append(("Low", "robots.txt not found", f"GET {robots_url} → {r_code}", "Add robots.txt to control crawling and list your sitemap."))
         score -= 4
@@ -384,7 +373,6 @@ def build_seo_findings(base: str, home_html: str, home_headers: dict):
             findings.append(("Medium", "robots.txt may block all crawling", "robots.txt contains 'Disallow: /'", "Allow crawling for public marketing pages."))
             score -= 10
 
-    # SITEMAP
     if s_code != 200:
         findings.append(("Low", "sitemap.xml not found", f"GET {sitemap_url} → {s_code}", "Add sitemap.xml for better discovery (especially for many pages)."))
         score -= 4
@@ -392,14 +380,12 @@ def build_seo_findings(base: str, home_html: str, home_headers: dict):
         if "<urlset" not in (s_txt or ""):
             findings.append(("Info", "sitemap.xml exists but may not be standard", "sitemap.xml didn’t include <urlset> in first check.", "Verify it’s a valid XML sitemap."))
 
-    # OG / Social previews
     if not (og_title and og_desc and og_img):
         findings.append(("Low", "OpenGraph tags incomplete", f"og:title={bool(og_title)}, og:description={bool(og_desc)}, og:image={bool(og_img)}", "Add OG tags for better link previews and CTR."))
         score -= 4
     if not tw_card:
         findings.append(("Info", "Twitter card not set", "twitter:card missing.", "Add twitter:card (summary_large_image) for better previews."))
 
-    # H1
     if h1s == 0:
         findings.append(("Medium", "No H1 found on homepage", "No <h1> tag detected.", "Add a single H1 describing your main offer (keyword + value)."))
         score -= 10
@@ -407,12 +393,10 @@ def build_seo_findings(base: str, home_html: str, home_headers: dict):
         findings.append(("Low", "Multiple H1 tags detected", f"H1 count: {h1s}", "Prefer a single H1 per page for clarity."))
         score -= 4
 
-    # Structured data
     if not schema_ok:
         findings.append(("Low", "No structured data detected", "No JSON-LD / microdata found.", "Add JSON-LD (Organization, WebSite, Product/Service) for richer results."))
         score -= 4
 
-    # Image alt
     if img_n > 0:
         coverage = int((img_with_alt / max(1, img_n)) * 100)
         if coverage < 60:
@@ -465,7 +449,6 @@ def calc_scores(home_blocked, header_score, meta_exposed, swagger_exposed, html_
     maint = max(10, min(100, maint))
 
     seo = seo_score
-
     return sec, perf, maint, seo
 
 
@@ -522,7 +505,6 @@ def run_public_scan_cached(app_url: str, app_id: str, env: str, cache_key: str):
             break
     cache_missing = (not cache_control) and (not home_blocked)
 
-    # SEO (public only, requires HTML)
     if home_blocked or not html:
         seo_score = 0
         seo_bullets = ["SEO checks limited because homepage HTML is not publicly accessible (401/403)."]
@@ -533,11 +515,11 @@ def run_public_scan_cached(app_url: str, app_id: str, env: str, cache_key: str):
     sec, perf, maint, seo = calc_scores(home_blocked, header_score, meta_exposed, swagger_exposed, html_kb, script_count, seo_score)
 
     key_bullets = []
-    key_bullets.append("Homepage is protected (401/403) or public; this affects what can be measured.")
-    key_bullets.append("Public metadata + swagger exposure can reveal app surface area.")
+    key_bullets.append("Homepage visibility affects what can be measured in a public scan.")
+    key_bullets.append("Public metadata + swagger exposure can reveal your app surface area.")
     key_bullets.append("Missing security headers increases XSS/clickjacking risk.")
     if perf == 0:
-        key_bullets.append("Performance snapshot is limited because HTML isn’t accessible to public scan.")
+        key_bullets.append("Performance snapshot is limited because HTML isn’t accessible publicly.")
     else:
         key_bullets.append(f"Homepage snapshot: ~{html_kb} KB HTML and ~{script_count} script tags.")
     key_bullets.extend(seo_bullets[:2])
@@ -582,7 +564,7 @@ def run_public_scan_cached(app_url: str, app_id: str, env: str, cache_key: str):
     else:
         findings_maint.append(("Info", "Maintainability detail limited (public scan)",
                                "No public swagger/meta available, or access restricted.",
-                               "Full maintainability audit needs Bubble editor access (workflows, data types, privacy rules)."))
+                               "Full maintainability audit needs editor access (workflows, data types, privacy rules)."))
 
     return {
         "base": base,
@@ -652,7 +634,7 @@ def render_items(items, gated: bool):
 # ---------------------------
 st.markdown("## Bubble App Auditor")
 st.markdown(
-    '<div class="muted">Public scan only (no Bubble API key required). Evidence-based checks from public endpoints.</div>',
+    '<div class="small">Public scan only (no Bubble API key required). Evidence-based checks from public endpoints.</div>',
     unsafe_allow_html=True
 )
 st.write("")
@@ -675,7 +657,9 @@ fingerprint = stable_cache_key(app_url, app_id, env)
 if st.session_state.get("last_fingerprint") != fingerprint:
     st.session_state["lead_unlocked"] = False
     st.session_state["last_fingerprint"] = fingerprint
-    st.session_state["lead_data"] = None
+
+if "lead_step" not in st.session_state:
+    st.session_state["lead_step"] = "form"   # form | calendly
 
 if not run_btn and "last_scan" not in st.session_state:
     st.info("Enter App URL or Bubble App ID, choose environment, then click **Run scan**.")
@@ -696,9 +680,8 @@ if run_btn or "last_scan" in st.session_state:
     status.info("Starting scan…")
     prog.progress(25)
 
-    time.sleep(0.1)
     status.info("Fetching and analyzing public endpoints…")
-    prog.progress(65)
+    prog.progress(70)
 
     scan = run_scan(app_url, app_id, env)
     if scan.get("error"):
@@ -803,31 +786,40 @@ with R:
     render_items(scan["findings"]["seo"], gated=gated)
 
     st.write("")
-    if not unlocked:
-        open_popup = st.button("Unlock full fix plan + book a call", type="primary", use_container_width=True)
-    else:
-        open_popup = st.button("Open booking popup", use_container_width=True)
+    open_popup = st.button("Unlock full fix plan + book a call", type="primary", use_container_width=True)
 
 
 # ---------------------------
-# MODAL POPUP
+# MODAL POPUP (FORM OR CALENDLY, NOT BOTH)
 # ---------------------------
-modal = Modal(title="Unlock full Fix Plan + Book a 30-min call", key="unlock_modal", max_width=800)
-
-if "lead_step" not in st.session_state:
-    st.session_state["lead_step"] = "form"
+modal = Modal(title="Unlock full Fix Plan + Book a 30-min call", key="unlock_modal", max_width=820)
 
 if open_popup:
     modal.open()
+    st.session_state["lead_step"] = "form" if not st.session_state.get("lead_unlocked", False) else "calendly"
 
 if modal.is_open():
     with modal.container():
-        st.markdown(
+        # force scroll-to-top inside the modal container (works in most Streamlit setups)
+        st.components.v1.html(
             """
+<script>
+setTimeout(() => {
+  const el = window.parent.document.querySelector('section.main');
+  if(el) el.scrollTo({top: 0, behavior: 'smooth'});
+}, 60);
+</script>
+""",
+            height=0
+        )
+
+        if st.session_state.get("lead_step") == "form":
+            st.markdown(
+                """
 <div class="cta">
   <h3 style="margin:0;">What you’ll get</h3>
   <div class="small" style="margin-top:8px;">
-    I’ll translate this scan into a clear action plan: what to fix first, how to fix it, and what to ignore.
+    A clear action plan: what to fix first, how to fix it, and what to ignore.
   </div>
   <div class="hr"></div>
   <div style="display:flex; gap:10px; flex-wrap:wrap;">
@@ -838,13 +830,11 @@ if modal.is_open():
   </div>
 </div>
 """,
-            unsafe_allow_html=True
-        )
-
-        st.write("")
-
-        if not st.session_state.get("lead_unlocked", False) or st.session_state["lead_step"] == "form":
+                unsafe_allow_html=True
+            )
+            st.write("")
             st.markdown("#### Enter details to unlock full fixes")
+
             with st.form("lead_form_modal", clear_on_submit=False):
                 c1, c2 = st.columns(2)
                 with c1:
@@ -861,11 +851,14 @@ if modal.is_open():
             if submitted:
                 st.session_state["lead_unlocked"] = True
                 st.session_state["lead_step"] = "calendly"
-                st.success("Unlocked ✅ Now pick a meeting time below.")
+                st.success("Unlocked ✅ Loading booking…")
+                st.rerun()
 
-        if st.session_state.get("lead_unlocked", False) and st.session_state["lead_step"] == "calendly":
-            st.markdown("#### Book your 30-minute meeting")
+        else:
+            # CALENDLY STEP (FORM HIDDEN)
+            st.markdown("### Book your 30-minute meeting")
             st.markdown('<div class="small">I’ll review your scan and point out the fastest wins first.</div>', unsafe_allow_html=True)
+            st.write("")
 
             st.components.v1.html(
                 f"""
@@ -876,11 +869,15 @@ if modal.is_open():
                 height=760
             )
 
-            c1, c2 = st.columns(2)
+            c1, c2, c3 = st.columns([1, 1, 1])
             with c1:
+                if st.button("Back", use_container_width=True):
+                    st.session_state["lead_step"] = "form"
+                    st.rerun()
+            with c2:
                 if st.button("Close", use_container_width=True):
                     modal.close()
-            with c2:
+            with c3:
                 if st.button("Start over", use_container_width=True):
                     st.session_state["lead_unlocked"] = False
                     st.session_state["lead_step"] = "form"
