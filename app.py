@@ -1,7 +1,7 @@
 import re
 import time
 import hashlib
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 import streamlit as st
@@ -15,13 +15,13 @@ CALENDLY_URL = "https://calendly.com/tassawarhussain/30min"
 REQUEST_TIMEOUT = 12
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "BubbleAppAuditor/2.3 (+public-scan)"})
+SESSION.headers.update({"User-Agent": "AppAuditor/3.0 (+public-scan)"})
 
 
 # ---------------------------
 # PAGE SETUP + STYLES
 # ---------------------------
-st.set_page_config(page_title="Bubble App Auditor", page_icon="🫧", layout="wide")
+st.set_page_config(page_title="App Auditor", page_icon="🧪", layout="wide")
 
 st.markdown(
     """
@@ -117,6 +117,14 @@ def normalize_url(u: str) -> str:
     if not u.startswith("http://") and not u.startswith("https://"):
         u = "https://" + u
     return u.rstrip("/")
+
+
+def is_valid_url(u: str) -> bool:
+    try:
+        p = urlparse(u)
+        return bool(p.scheme and p.netloc)
+    except Exception:
+        return False
 
 
 def env_base_from_inputs(app_url: str, app_id: str, env: str) -> str:
@@ -236,16 +244,16 @@ def probe_paths(base: str, paths):
     return out
 
 
-def build_evidence_lines(scan):
+def build_evidence_lines(steps, probe=None):
     lines = []
-    for (name, url, code, elapsed, err) in scan.get("steps", []):
+    for (name, url, code, elapsed, err) in steps:
         ms = f"{int(elapsed*1000)}ms"
         if code is None:
             lines.append(f"{name}: ERROR ({err}) — {ms}")
         else:
             lines.append(f"{name}: {code} — {ms} — {url}")
 
-    for pr in scan.get("probe", [])[:8]:
+    for pr in (probe or [])[:8]:
         s = pr.get("status")
         ms = f"{int(pr.get('elapsed',0)*1000)}ms"
         lines.append(f"Probe {pr['path']}: {s} — {ms}")
@@ -418,177 +426,6 @@ def build_seo_findings(base: str, home_html: str, home_headers: dict):
     return score, bullets, findings
 
 
-def calc_scores(home_blocked, header_score, meta_exposed, swagger_exposed, html_kb, script_count, seo_score):
-    sec = 100
-    sec -= int((100 - header_score) * 0.45)
-    if meta_exposed:
-        sec -= 18
-    if swagger_exposed:
-        sec -= 12
-    if home_blocked:
-        sec += 6
-    sec = max(5, min(100, sec))
-
-    if home_blocked or html_kb is None:
-        perf = 0
-    else:
-        perf = 100
-        if html_kb > 900:
-            perf -= 18
-        elif html_kb > 500:
-            perf -= 10
-        if script_count and script_count > 40:
-            perf -= 12
-        elif script_count and script_count > 25:
-            perf -= 7
-        perf = max(10, min(100, perf))
-
-    maint = 100
-    if swagger_exposed:
-        maint -= 10
-    maint = max(10, min(100, maint))
-
-    seo = seo_score
-    return sec, perf, maint, seo
-
-
-def stable_cache_key(app_url: str, app_id: str, env: str):
-    s = f"{normalize_url(app_url)}|{(app_id or '').strip()}|{env}"
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:18]
-
-
-@st.cache_data(show_spinner=False)
-def run_public_scan_cached(app_url: str, app_id: str, env: str, cache_key: str):
-    base = env_base_from_inputs(app_url, app_id, env)
-    if not base:
-        return {"error": "Missing App URL or Bubble App ID."}
-
-    steps = []
-
-    home_url = base + "/"
-    code, headers, html, _, elapsed, err = safe_get(home_url)
-    steps.append(("Fetch homepage", home_url, code, elapsed, err))
-    home_blocked = code in (401, 403)
-
-    title = find_title(html) if (html and not home_blocked) else ((app_id.strip() if app_id else "Bubble App").lower())
-    og_img = find_og_image(html, base) if (html and not home_blocked) else ""
-    favicon = find_favicon(html, base) if (html and not home_blocked) else urljoin(base + "/", "favicon.ico")
-    logo_url = og_img if og_img else favicon
-
-    header_score, header_present, header_missing = score_headers(headers or {})
-
-    meta_url = base + "/api/1.1/meta"
-    m_code, _, _, m_json, m_elapsed, m_err = safe_get(meta_url)
-    steps.append(("Fetch /api/1.1/meta", meta_url, m_code, m_elapsed, m_err))
-    meta_exposed = (m_code == 200 and isinstance(m_json, dict))
-
-    swagger_url = base + "/api/1.1/meta/swagger.json"
-    s_code, _, _, s_json, s_elapsed, s_err = safe_get(swagger_url)
-    steps.append(("Fetch swagger.json", swagger_url, s_code, s_elapsed, s_err))
-    swagger_exposed = (s_code == 200 and isinstance(s_json, dict))
-
-    swagger_paths = swagger_methods = 0
-    swagger_samples = []
-    if swagger_exposed:
-        swagger_paths, swagger_methods, swagger_samples = extract_swagger_stats(s_json)
-
-    admin_candidates = ["/admin", "/dashboard", "/settings", "/super_admin", "/superadmin", "/backend", "/login"]
-    probe = probe_paths(base, admin_candidates)
-
-    html_kb = int(len(html.encode("utf-8")) / 1024) if (html and not home_blocked) else None
-    script_count = len(re.findall(r"<script\b", html or "", re.I)) if (html and not home_blocked) else None
-
-    cache_control = ""
-    for hk, hv in (headers or {}).items():
-        if hk.lower() == "cache-control":
-            cache_control = hv
-            break
-    cache_missing = (not cache_control) and (not home_blocked)
-
-    if home_blocked or not html:
-        seo_score = 0
-        seo_bullets = ["SEO checks limited because homepage HTML is not publicly accessible (401/403)."]
-        seo_findings = [("Info", "SEO checks limited", f"GET {home_url} → {code}", "Make a public marketing page for accurate SEO checks.")]
-    else:
-        seo_score, seo_bullets, seo_findings = build_seo_findings(base, html, headers or {})
-
-    sec, perf, maint, seo = calc_scores(home_blocked, header_score, meta_exposed, swagger_exposed, html_kb, script_count, seo_score)
-
-    key_bullets = []
-    key_bullets.append("Homepage visibility affects what can be measured in a public scan.")
-    key_bullets.append("Public metadata + swagger exposure can reveal your app surface area.")
-    key_bullets.append("Missing security headers increases XSS/clickjacking risk.")
-    if perf == 0:
-        key_bullets.append("Performance snapshot is limited because HTML isn’t accessible publicly.")
-    else:
-        key_bullets.append(f"Homepage snapshot: ~{html_kb} KB HTML and ~{script_count} script tags.")
-    key_bullets.extend(seo_bullets[:2])
-
-    findings_security = []
-    if meta_exposed:
-        findings_security.append(("High", "Public /api/1.1/meta is accessible",
-                                 f"GET {meta_url} → 200",
-                                 "Restrict public metadata exposure and confirm no sensitive public endpoints."))
-    if swagger_exposed:
-        findings_security.append(("Medium", "Public swagger schema is accessible",
-                                 f"GET {swagger_url} → 200 ({swagger_paths} paths)",
-                                 "Ensure API authorization is strict and restrict swagger if not needed."))
-    if header_missing:
-        findings_security.append(("Medium", "Missing recommended security headers",
-                                 "Missing: " + ", ".join(header_missing),
-                                 "Add CSP/HSTS/XFO/Referrer/Permissions policies via CDN/proxy."))
-    if not findings_security:
-        findings_security.append(("Low", "No major public red flags detected",
-                                 "Public endpoints did not expose meta/swagger and headers look reasonable.",
-                                 "Consider a deeper audit if you handle sensitive data or payments."))
-
-    findings_perf = []
-    if perf == 0:
-        findings_perf.append(("Info", "Performance details limited",
-                              f"GET {home_url} → {code}",
-                              "Share a public test page or collaborator access for deeper profiling."))
-    else:
-        findings_perf.append(("Info", "Homepage payload snapshot",
-                              f"HTML ≈ {html_kb} KB, scripts ≈ {script_count}",
-                              "Reduce plugin bloat, defer heavy scripts, avoid workflows on page load."))
-        if cache_missing:
-            findings_perf.append(("Low", "Cache-Control not detected on homepage response",
-                                  "Cache-Control header missing",
-                                  "Configure caching for static assets at CDN/proxy level."))
-
-    findings_maint = []
-    if swagger_exposed and swagger_samples:
-        findings_maint.append(("Info", "Public API surface snapshot (sample paths)",
-                               "Sample: " + ", ".join(swagger_samples[:10]) + ("..." if len(swagger_samples) > 10 else ""),
-                               "Document endpoints and standardize auth + naming patterns."))
-    else:
-        findings_maint.append(("Info", "Maintainability detail limited (public scan)",
-                               "No public swagger/meta available, or access restricted.",
-                               "Full maintainability audit needs editor access (workflows, data types, privacy rules)."))
-
-    return {
-        "base": base,
-        "title": title,
-        "logo_url": logo_url,
-        "home_url": home_url,
-        "steps": steps,
-        "scores": {"security": sec, "performance": perf, "maintainability": maint, "seo": seo},
-        "key_bullets": key_bullets,
-        "findings": {
-            "security": findings_security,
-            "performance": findings_perf,
-            "maintainability": findings_maint,
-            "seo": seo_findings
-        },
-        "evidence": build_evidence_lines({"steps": steps, "probe": probe}),
-    }
-
-
-def run_scan(app_url: str, app_id: str, env: str):
-    ck = stable_cache_key(app_url, app_id, env)
-    return run_public_scan_cached(app_url, app_id, env, ck)
-
-
 def badge(sev: str):
     return f'<span class="badge sev-{sev}">{sev}</span>'
 
@@ -630,30 +467,302 @@ def render_items(items, gated: bool):
 
 
 # ---------------------------
+# SCANS
+# ---------------------------
+def stable_cache_key(platform: str, app_url: str, app_id: str, env: str):
+    s = f"{platform}|{normalize_url(app_url)}|{(app_id or '').strip()}|{env}"
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:18]
+
+
+@st.cache_data(show_spinner=False)
+def run_bubble_scan_cached(app_url: str, app_id: str, env: str, cache_key: str):
+    base = env_base_from_inputs(app_url, app_id, env)
+    if not base:
+        return {"error": "Missing App URL or Bubble App ID."}
+
+    steps = []
+
+    home_url = base + "/"
+    code, headers, html, _, elapsed, err = safe_get(home_url)
+    steps.append(("Fetch homepage", home_url, code, elapsed, err))
+    home_blocked = code in (401, 403)
+
+    title = find_title(html) if (html and not home_blocked) else ((app_id.strip() if app_id else "Bubble App"))
+    og_img = find_og_image(html, base) if (html and not home_blocked) else ""
+    favicon = find_favicon(html, base) if (html and not home_blocked) else urljoin(base + "/", "favicon.ico")
+    logo_url = og_img if og_img else favicon
+
+    header_score, _, header_missing = score_headers(headers or {})
+
+    meta_url = base + "/api/1.1/meta"
+    m_code, _, _, m_json, m_elapsed, m_err = safe_get(meta_url)
+    steps.append(("Fetch /api/1.1/meta", meta_url, m_code, m_elapsed, m_err))
+    meta_exposed = (m_code == 200 and isinstance(m_json, dict))
+
+    swagger_url = base + "/api/1.1/meta/swagger.json"
+    s_code, _, _, s_json, s_elapsed, s_err = safe_get(swagger_url)
+    steps.append(("Fetch swagger.json", swagger_url, s_code, s_elapsed, s_err))
+    swagger_exposed = (s_code == 200 and isinstance(s_json, dict))
+
+    swagger_paths = 0
+    swagger_samples = []
+    if swagger_exposed:
+        swagger_paths, _, swagger_samples = extract_swagger_stats(s_json)
+
+    admin_candidates = ["/admin", "/dashboard", "/settings", "/super_admin", "/superadmin", "/backend", "/login"]
+    probe = probe_paths(base, admin_candidates)
+
+    html_kb = int(len(html.encode("utf-8")) / 1024) if (html and not home_blocked) else None
+    script_count = len(re.findall(r"<script\b", html or "", re.I)) if (html and not home_blocked) else None
+
+    # SEO
+    if home_blocked or not html:
+        seo_score = 0
+        seo_bullets = ["SEO checks limited because homepage HTML is not publicly accessible (401/403)."]
+        seo_findings = [("Info", "SEO checks limited", f"GET {home_url} → {code}", "Make a public marketing page for accurate SEO checks.")]
+    else:
+        seo_score, seo_bullets, seo_findings = build_seo_findings(base, html, headers or {})
+
+    # Scores
+    sec = 100
+    sec -= int((100 - header_score) * 0.45)
+    if meta_exposed:
+        sec -= 18
+    if swagger_exposed:
+        sec -= 12
+    if home_blocked:
+        sec += 6
+    sec = max(5, min(100, sec))
+
+    if home_blocked or html_kb is None:
+        perf = 0
+    else:
+        perf = 100
+        if html_kb > 900:
+            perf -= 18
+        elif html_kb > 500:
+            perf -= 10
+        if script_count and script_count > 40:
+            perf -= 12
+        elif script_count and script_count > 25:
+            perf -= 7
+        perf = max(10, min(100, perf))
+
+    maint = 100
+    if swagger_exposed:
+        maint -= 10
+    maint = max(10, min(100, maint))
+
+    seo = seo_score
+
+    # Key bullets
+    key_bullets = [
+        "This is a public scan (no API key). Private editor rules/workflows are not accessible.",
+        "Public metadata + swagger exposure can reveal your API surface area.",
+        f"Security headers missing: {', '.join(header_missing) if header_missing else 'none detected'}",
+    ]
+    if perf == 0:
+        key_bullets.append("Performance snapshot limited because the homepage isn’t publicly accessible.")
+    else:
+        key_bullets.append(f"Homepage snapshot: ~{html_kb} KB HTML and ~{script_count} script tags.")
+    key_bullets.extend(seo_bullets[:2])
+
+    # Findings
+    findings_security = []
+    if meta_exposed:
+        findings_security.append(("High", "Public /api/1.1/meta is accessible", f"GET {meta_url} → 200", "Restrict metadata exposure if it reveals sensitive structure."))
+    if swagger_exposed:
+        findings_security.append(("Medium", "Public swagger schema is accessible", f"GET {swagger_url} → 200 ({swagger_paths} paths)", "Ensure API auth is strict; hide swagger if not needed."))
+    if header_missing:
+        findings_security.append(("Medium", "Missing recommended security headers", "Missing: " + ", ".join(header_missing), "Add CSP/HSTS/XFO/Referrer/Permissions policies at CDN/proxy."))
+    if not findings_security:
+        findings_security.append(("Low", "No major public security red flags detected", "Public endpoints did not expose meta/swagger and headers look reasonable.", "Do a deeper audit if you handle sensitive data."))
+
+    findings_perf = []
+    if perf == 0:
+        findings_perf.append(("Info", "Performance details limited", f"GET {home_url} → {code}", "Share a public page for deeper checks."))
+    else:
+        findings_perf.append(("Info", "Homepage payload snapshot", f"HTML ≈ {html_kb} KB, scripts ≈ {script_count}", "Reduce plugin bloat; defer heavy scripts; avoid workflows on load."))
+
+    findings_maint = []
+    if swagger_exposed and swagger_samples:
+        findings_maint.append(("Info", "Public API surface snapshot (sample paths)", "Sample: " + ", ".join(swagger_samples[:10]) + ("..." if len(swagger_samples) > 10 else ""), "Document endpoints; standardize auth + naming patterns."))
+    else:
+        findings_maint.append(("Info", "Maintainability detail limited (public scan)", "No public swagger/meta available, or access restricted.", "Full audit needs editor access (workflows, data types, privacy rules)."))
+
+    return {
+        "platform": "Bubble",
+        "base": base,
+        "title": title,
+        "logo_url": logo_url,
+        "home_url": home_url,
+        "steps": steps,
+        "scores": {"security": sec, "performance": perf, "maintainability": maint, "seo": seo},
+        "key_bullets": key_bullets,
+        "findings": {
+            "security": findings_security,
+            "performance": findings_perf,
+            "maintainability": findings_maint,
+            "seo": seo_findings,
+        },
+        "evidence": build_evidence_lines(steps, probe=probe),
+    }
+
+
+@st.cache_data(show_spinner=False)
+def run_lovable_scan_cached(app_url: str, cache_key: str):
+    base = normalize_url(app_url)
+    if not base or not is_valid_url(base):
+        return {"error": "Please enter a valid Lovable app URL (must include domain)."}
+
+    steps = []
+    home_url = base + "/"
+    code, headers, html, _, elapsed, err = safe_get(home_url)
+    steps.append(("Fetch homepage", home_url, code, elapsed, err))
+    home_blocked = code in (401, 403)
+
+    title = find_title(html) if (html and not home_blocked) else "Lovable App"
+    og_img = find_og_image(html, base) if (html and not home_blocked) else ""
+    favicon = find_favicon(html, base) if (html and not home_blocked) else urljoin(base + "/", "favicon.ico")
+    logo_url = og_img if og_img else favicon
+
+    header_score, _, header_missing = score_headers(headers or {})
+
+    html_kb = int(len(html.encode("utf-8")) / 1024) if (html and not home_blocked) else None
+    script_count = len(re.findall(r"<script\b", html or "", re.I)) if (html and not home_blocked) else None
+
+    # Public exposure probes (generic web)
+    probe_paths_list = ["/.env", "/env", "/server-status", "/.git/config", "/sitemap.xml", "/robots.txt"]
+    probe = probe_paths(base, probe_paths_list)
+
+    # SEO
+    if home_blocked or not html:
+        seo_score = 0
+        seo_bullets = ["SEO checks limited because homepage HTML is not publicly accessible (401/403)."]
+        seo_findings = [("Info", "SEO checks limited", f"GET {home_url} → {code}", "Make sure your marketing page is public to validate SEO.")]
+    else:
+        seo_score, seo_bullets, seo_findings = build_seo_findings(base, html, headers or {})
+
+    # Scores
+    sec = 100
+    sec -= int((100 - header_score) * 0.55)
+    if home_blocked:
+        sec += 4
+    # If sensitive paths respond 200, reduce security
+    exposed_hits = [p for p in probe if p.get("status") == 200]
+    if exposed_hits:
+        sec -= 18
+    sec = max(5, min(100, sec))
+
+    if home_blocked or html_kb is None:
+        perf = 0
+    else:
+        perf = 100
+        if html_kb > 900:
+            perf -= 18
+        elif html_kb > 500:
+            perf -= 10
+        if script_count and script_count > 40:
+            perf -= 12
+        elif script_count and script_count > 25:
+            perf -= 7
+        perf = max(10, min(100, perf))
+
+    maint = 85  # Lovable: public scan can’t infer internal architecture
+    seo = seo_score
+
+    key_bullets = [
+        "Lovable audit uses public web checks (headers, SEO, payload size).",
+        f"Security headers missing: {', '.join(header_missing) if header_missing else 'none detected'}",
+    ]
+    if exposed_hits:
+        key_bullets.append("Some sensitive/common files appear publicly accessible (needs review).")
+    else:
+        key_bullets.append("No obvious sensitive file exposure detected in basic probes.")
+    if perf == 0:
+        key_bullets.append("Performance snapshot limited because the homepage isn’t publicly accessible.")
+    else:
+        key_bullets.append(f"Homepage snapshot: ~{html_kb} KB HTML and ~{script_count} script tags.")
+    key_bullets.extend(seo_bullets[:2])
+
+    findings_security = []
+    if header_missing:
+        findings_security.append(("Medium", "Missing recommended security headers", "Missing: " + ", ".join(header_missing), "Add CSP/HSTS/XFO/Referrer/Permissions policies at CDN/proxy."))
+    if exposed_hits:
+        examples = ", ".join([e["path"] for e in exposed_hits[:5]])
+        findings_security.append(("High", "Potential sensitive file exposure", f"200 OK on: {examples}", "Block access to config/debug files and review deployment rules."))
+    if not findings_security:
+        findings_security.append(("Low", "No major public security red flags detected", "Headers look reasonable and no obvious sensitive file exposure in basic probes.", "Consider deeper review if handling auth, payments, or PII."))
+
+    findings_perf = []
+    if perf == 0:
+        findings_perf.append(("Info", "Performance details limited", f"GET {home_url} → {code}", "Make sure the marketing/home page is public for accurate checks."))
+    else:
+        findings_perf.append(("Info", "Homepage payload snapshot", f"HTML ≈ {html_kb} KB, scripts ≈ {script_count}", "Reduce heavy bundles; lazy-load non-critical components."))
+
+    findings_maint = [
+        ("Info", "Maintainability is limited in a public scan", "We can’t see internal components, data models, or build setup publicly.", "Share repo or staging access for a deeper architecture review.")
+    ]
+
+    return {
+        "platform": "Lovable",
+        "base": base,
+        "title": title,
+        "logo_url": logo_url,
+        "home_url": home_url,
+        "steps": steps,
+        "scores": {"security": sec, "performance": perf, "maintainability": maint, "seo": seo},
+        "key_bullets": key_bullets,
+        "findings": {
+            "security": findings_security,
+            "performance": findings_perf,
+            "maintainability": findings_maint,
+            "seo": seo_findings,
+        },
+        "evidence": build_evidence_lines(steps, probe=probe),
+    }
+
+
+def run_scan(platform: str, app_url: str, app_id: str, env: str):
+    ck = stable_cache_key(platform, app_url, app_id, env)
+    if platform == "Bubble":
+        return run_bubble_scan_cached(app_url, app_id, env, ck)
+    return run_lovable_scan_cached(app_url, ck)
+
+
+# ---------------------------
 # HEADER
 # ---------------------------
-st.markdown("## Bubble App Auditor")
-st.markdown(
-    '<div class="small">Public scan only (no Bubble API key required). Evidence-based checks from public endpoints.</div>',
-    unsafe_allow_html=True
-)
+st.markdown("## App Auditor")
+st.markdown('<div class="small">Pick a platform, run a public scan, then unlock fixes + book a call.</div>', unsafe_allow_html=True)
 st.write("")
 
 
 # ---------------------------
 # INPUTS
 # ---------------------------
+platform = st.radio("Choose audit type", ["Bubble", "Lovable"], horizontal=True)
+
 c1, c2, c3 = st.columns([0.44, 0.28, 0.28])
+
 with c1:
-    app_url = st.text_input("App URL (optional)", placeholder="yourapp.com or https://yourapp.bubbleapps.io")
+    app_url = st.text_input("App URL", placeholder="yourapp.com or https://yourapp.bubbleapps.io")
 with c2:
-    app_id = st.text_input("Bubble App ID (recommended)", placeholder="yourapp-28503")
+    if platform == "Bubble":
+        app_id = st.text_input("Bubble App ID (recommended)", placeholder="yourapp-28503")
+    else:
+        app_id = ""
+        st.text_input("Lovable App ID", value="Not required", disabled=True)
 with c3:
-    env = st.selectbox("Environment", ["live", "version-test"], index=0)
+    if platform == "Bubble":
+        env = st.selectbox("Environment", ["live", "version-test"], index=0)
+    else:
+        env = "live"
+        st.selectbox("Environment", ["live"], index=0, disabled=True)
 
 run_btn = st.button("Run scan", type="primary", use_container_width=True)
 
-fingerprint = stable_cache_key(app_url, app_id, env)
+fingerprint = stable_cache_key(platform, app_url, app_id, env)
 if st.session_state.get("last_fingerprint") != fingerprint:
     st.session_state["lead_unlocked"] = False
     st.session_state["last_fingerprint"] = fingerprint
@@ -662,7 +771,7 @@ if "lead_step" not in st.session_state:
     st.session_state["lead_step"] = "form"   # form | calendly
 
 if not run_btn and "last_scan" not in st.session_state:
-    st.info("Enter App URL or Bubble App ID, choose environment, then click **Run scan**.")
+    st.info("Choose Bubble or Lovable, enter the URL (Bubble: ID optional), then click **Run scan**.")
     st.stop()
 
 
@@ -670,9 +779,9 @@ if not run_btn and "last_scan" not in st.session_state:
 # RUN SCAN
 # ---------------------------
 if run_btn or "last_scan" in st.session_state:
-    base = env_base_from_inputs(app_url, app_id, env)
-    if not base:
-        st.error("Please enter at least App URL or Bubble App ID.")
+    base_url = normalize_url(app_url)
+    if not base_url:
+        st.error("Please enter the App URL.")
         st.stop()
 
     prog = st.progress(0)
@@ -683,7 +792,7 @@ if run_btn or "last_scan" in st.session_state:
     status.info("Fetching and analyzing public endpoints…")
     prog.progress(70)
 
-    scan = run_scan(app_url, app_id, env)
+    scan = run_scan(platform, app_url, app_id, env)
     if scan.get("error"):
         st.error(scan["error"])
         st.stop()
@@ -705,7 +814,8 @@ with L:
     if scan.get("logo_url"):
         st.image(scan["logo_url"], width=72)
 
-    st.markdown(f"### {scan.get('title','Bubble App')}")
+    st.markdown(f"### {scan.get('title','App')}")
+    st.markdown(f'<div class="small">{scan.get("platform","")}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="small">{scan.get("base","")}</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
@@ -751,7 +861,7 @@ with L:
         st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
-    st.caption("Note: Public scan can’t read Bubble editor privacy rules/workflows unless publicly exposed.")
+    st.caption("Note: Public scans can’t see private editor settings, internal DB rules, or workflow logic.")
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.write("")
@@ -761,7 +871,7 @@ with L:
 with R:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("### Key risks and focus areas")
-    for b in scan.get("key_bullets", [])[:7]:
+    for b in scan.get("key_bullets", [])[:8]:
         st.write(f"• {b}")
     st.markdown("</div>", unsafe_allow_html=True)
     st.write("")
@@ -800,7 +910,6 @@ if open_popup:
 
 if modal.is_open():
     with modal.container():
-        # force scroll-to-top inside the modal container (works in most Streamlit setups)
         st.components.v1.html(
             """
 <script>
@@ -840,11 +949,11 @@ setTimeout(() => {
                 with c1:
                     name = st.text_input("Your name")
                     email = st.text_input("Email")
-                    role = st.selectbox("Your role", ["Founder", "Bubble Developer", "Product", "Agency", "Other"])
+                    role = st.selectbox("Your role", ["Founder", "Developer", "Product", "Agency", "Other"])
                 with c2:
                     company = st.text_input("Company (optional)")
                     timeline = st.selectbox("Timeline", ["ASAP (this week)", "This month", "Next 1–3 months", "Just exploring"])
-                    notes = st.text_area("What should I know? (optional)", placeholder="e.g. marketplace, user files, paid plans, etc.")
+                    notes = st.text_area("What should I know? (optional)", placeholder="e.g. auth, payments, user files, SEO goals, etc.")
 
                 submitted = st.form_submit_button("Unlock + Continue to booking", type="primary", use_container_width=True)
 
@@ -855,7 +964,6 @@ setTimeout(() => {
                 st.rerun()
 
         else:
-            # CALENDLY STEP (FORM HIDDEN)
             st.markdown("### Book your 30-minute meeting")
             st.markdown('<div class="small">I’ll review your scan and point out the fastest wins first.</div>', unsafe_allow_html=True)
             st.write("")
